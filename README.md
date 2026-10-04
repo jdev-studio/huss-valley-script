@@ -21,9 +21,11 @@ Written against Matcha, with its Drawing API, keyboard/focus functions and memor
 
 Set **Dash max cooldown** to `0`, enable **Tune Dash**, and enable **Re-arm dash on Space release**. Release Space after each dash, then change direction and press it again. The game's turn and grounding requirements still apply. Holding Space preserves the current dash motion.
 
-The script identifies the private dash timers and reuses verified addresses. Missing or inconsistent GC owner metadata now falls back to live hash-table lookup, checking all four numeric fields and the private dash count before binding. Addresses are discovered on each PC. When they change, it checks cached blocks and a bounded nearby region before falling back to a full scan. Field identities and write readback are checked. Full scans can still cause a pause, and game or server changes can limit client tuning.
+The script identifies the private dash timers and learns the MovementModel table header through its movement-history link. The header layout is verified on each PC. Once tracking is enabled, it checks the table's current storage pointer each frame. A change reads only that table's small node array, verifies all field names and the live dash count, then resumes tuning without a full GC scan or the old stale-address waiting period.
 
-If Dash reports a memory access/version error, confirm unsafe Lua execution is enabled in Matcha. The fallback requires `memory_read` and `memory_write` and a verifiable Luau node format. Check the console for `Loaded Huss Valley v0.6.14` to confirm the updated loader result.
+Look for `Dash table tracking enabled` in the console. Relocation recovery logs `Followed dash table` with its lookup time. Initial identification still uses GC. Unsupported or ambiguous headers, lost controller objects and character replacement retain the cached/nearby/full-scan fallback, so those cases can still cause a pause.
+
+If Dash reports a memory access/version error, confirm unsafe Lua execution is enabled in Matcha. Tracking requires `memory_read` and `memory_write` and verifiable table/node metadata. Check the console for `Loaded Huss Valley v0.6.15` to confirm the updated loader result.
 
 ## Controls
 
@@ -39,4 +41,4 @@ Toggles, sliders, theme and menu key are saved to `huss_valley_config.json` in M
 
 ## Version
 
-Current version: **0.6.14**. See [CHANGELOG.md](CHANGELOG.md).
+Current version: **0.6.15**. See [CHANGELOG.md](CHANGELOG.md).

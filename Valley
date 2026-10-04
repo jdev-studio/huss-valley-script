@@ -88,6 +88,8 @@ local function restoreCooldown(tuner)
     tuner.stateCandidates, tuner.stateObserved, tuner.stateProbeCount, tuner.stateValidatedCount = nil, nil, nil, nil
     tuner.nodeLayouts, tuner.nodeAnchor, tuner.nodeSearch, tuner.nodeAttempted = nil, nil, nil, nil
     tuner.portableScan, tuner.portableStatus = nil, nil
+    tuner.historySeeds, tuner.trackerSearch, tuner.tableTracker, tuner.tableFaultAt = nil, nil, nil, nil
+    tuner.trackingHeaders = nil
 end
 function app.stop()
     if not app.alive then return end
@@ -203,12 +205,12 @@ local function memoryValue(kind, address)
     local success, value = pcall(memory_read, kind, address)
     if success then return value end
 end
-local function nodeKey(address, key, reference)
+local function nodeKey(address, key, reference, valueTag)
 
     local pointer = memoryValue("uintptr_t", address + 16)
     if not validAddress(pointer) or pointer < 65536 or (reference and pointer ~= reference) then return end
     local tag = memoryValue("int", address + 28)
-    if memoryValue("int", address + 12) ~= 3 or not finite(tag) or tag % 16 ~= 6 then return end
+    if memoryValue("int", address + 12) ~= (valueTag or 3) or not finite(tag) or tag % 16 ~= 6 then return end
     if memoryValue("int", pointer + 20) ~= #key or memoryValue("string", pointer + 24) ~= key then return end
     return pointer
 end
@@ -250,7 +252,10 @@ local function dashTimerWrite(entries, values)
     for _, entry in ipairs(entries) do
         if not nodeKey(entry.addr, entry.key, entry.keyRef) then return nil end
     end
-    for _, entry in ipairs(entries) do memory_write("double", entry.addr, values[entry.key]) end
+    for _, entry in ipairs(entries) do
+        if entry.tableAddress and memoryValue("uintptr_t", entry.tableAddress + entry.nodeOffset) ~= entry.nodeBase then return nil end
+        memory_write("double", entry.addr, values[entry.key])
+    end
     return #entries
 end
 local function applyDashCap(tuner, entry, before, now)
@@ -325,7 +330,7 @@ local function selectDashState(groups, count, published)
     end
     return matches == 1 and selected or nil, matches
 end
-local function hashDashField(base, size, reference, name)
+local function hashDashField(base, size, reference, name, valueTag)
     local hash = memoryValue("int", reference + 16)
     if not finite(hash) or hash % 1 ~= 0 then return end
     local index, visited = hash % size, {}
@@ -337,7 +342,7 @@ local function hashDashField(base, size, reference, name)
         local tag = memoryValue("int", address + 28)
         if not finite(tag) or tag % 1 ~= 0 or tag % 16 == 0 then return end
         if pointer == reference then
-            if nodeKey(address, name, reference) then return address end
+            if nodeKey(address, name, reference, valueTag) then return address end
             return
         end
         local nextIndex = math.floor(tag / 16)
@@ -425,6 +430,137 @@ local function portableDashState(tuner, count, published)
     log(string.format("Portable dash lookup: %d verified tables, %d live matches in %.3fs", #scan.groups, matches, tick() - scan.began))
     return selected, false
 end
+local function trackedNodeGroup(base, size, tracker)
+    local group = { localNodes = true, tracked = true }
+    local history
+    for index = 0, size - 1 do
+        local address = base + index * 32
+        local reference = memoryValue("uintptr_t", address + 16)
+        if reference == tracker.historyRef then
+            if history or not nodeKey(address, "travelHistory", reference, tracker.historyTag)
+                or memoryValue("uintptr_t", address) ~= tracker.history then return end
+            history = address
+        else
+            for _, name in ipairs(dashKeys) do
+                if reference == tracker.references[name] then
+                    if group[name] or not nodeKey(address, name, reference) then return end
+                    group[name] = { key = name, type = "number", addr = address, tbl = tracker.address,
+                        localNode = true, keyRef = reference, tableAddress = tracker.address,
+                        nodeOffset = tracker.nodeOffset, nodeBase = base }
+                end
+            end
+        end
+    end
+    if not history then return end
+    for _, name in ipairs(dashKeys) do if not group[name] then return end end
+    return group
+end
+local function prepareDashTracking(tuner, group)
+    if tuner.tableTracker or not tuner.historySeeds or #tuner.historySeeds == 0 or type(memory_write) ~= "function" then return end
+    local references, expected = {}, {}
+    for _, name in ipairs(dashKeys) do
+        local address = group and group[name] and tonumber(group[name].addr)
+        if group and not validAddress(address) then return end
+        references[name] = group and nodeKey(address, name) or (tuner.portableScan and tuner.portableScan.references[name])
+        if not references[name] then return end
+        if group then expected[name] = address end
+    end
+    tuner.trackerSearch = { seeds = tuner.historySeeds, seed = 1, cursor = 0,
+        references = references, expected = group and expected, matches = {}, seen = {}, matched = {} }
+end
+local function dashTrackingSearchStep(tuner, count, published)
+    local search = tuner.trackerSearch
+    if not search then return end
+    local began = tick()
+    for attempt = 1, 128 do
+        if search.seed > #search.seeds or (attempt > 1 and tick() - began >= .002) then break end
+        local seed, cursor = search.seeds[search.seed], search.cursor
+        local offset = math.ceil(cursor / 2) * 8 * (cursor % 2 == 0 and -1 or 1)
+        local address = seed.history + offset
+        search.cursor = cursor + 1
+        if search.cursor > 1024 then search.cursor = 0; search.seed = search.seed + 1 end
+        search.seen[seed.history] = search.seen[seed.history] or {}
+        if not search.seen[seed.history][address] then
+            search.seen[seed.history][address] = true
+            for typeOffset = 0, 2 do
+                if memoryValue("byte", address + typeOffset) == seed.historyTag then
+                    for powerOffset = 3, 6 do
+                        local power = memoryValue("byte", address + powerOffset)
+                        if finite(power) and power >= 5 and power <= 8 and power % 1 == 0
+                            and memoryValue("byte", address + powerOffset + 1) == (2 ^ power - 1) % 256 then
+                            for nodeOffset = 16, 40, 8 do
+                                local base = memoryValue("uintptr_t", address + nodeOffset)
+                                if validAddress(base) and base >= 65536 then
+                                    local tracker = { address = address, typeOffset = typeOffset, powerOffset = powerOffset,
+                                        nodeOffset = nodeOffset, history = seed.history, historyRef = seed.historyRef,
+                                        historyTag = seed.historyTag, references = search.references }
+                                    local group = trackedNodeGroup(base, 2 ^ power, tracker)
+                                    if group and search.expected then
+                                        for _, name in ipairs(dashKeys) do
+                                            if group[name].addr ~= search.expected[name] then group = nil; break end
+                                        end
+                                    end
+                                    if group and not search.matched[address] then
+                                        search.matched[address] = true; search.matches[#search.matches + 1] = tracker
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if search.seed <= #search.seeds then return end
+    tuner.trackerSearch = nil
+    tuner.trackingHeaders = search.matches
+    log("Dash table tracking: " .. #search.matches .. " verified headers")
+end
+local function selectTrackedHeader(tuner, count, published)
+    local selected, matches = nil, 0
+    for _, tracker in ipairs(tuner.trackingHeaders or {}) do
+        local power = memoryValue("byte", tracker.address + tracker.powerOffset)
+        local base = memoryValue("uintptr_t", tracker.address + tracker.nodeOffset)
+        if finite(power) and power >= 5 and power <= 8 and power % 1 == 0 and validAddress(base)
+            and memoryValue("byte", tracker.address + tracker.typeOffset) == tracker.historyTag
+            and memoryValue("byte", tracker.address + tracker.powerOffset + 1) == (2 ^ power - 1) % 256 then
+            local group = trackedNodeGroup(base, 2 ^ power, tracker)
+            if group and selectDashState({ group }, count, published) then selected, matches = tracker, matches + 1 end
+        end
+    end
+    if matches ~= 1 then return end
+    tuner.tableTracker, tuner.trackingHeaders = selected, nil
+    log("Dash table tracking enabled @" .. selected.address .. "; verified header and history link")
+end
+local function trackedDashState(tuner, count, published, now)
+    local began = tick()
+    if not tuner.tableTracker then selectTrackedHeader(tuner, count, published) end
+    local tracker = tuner.tableTracker
+    if not tracker then return nil, false end
+    local power = memoryValue("byte", tracker.address + tracker.powerOffset)
+    local base = memoryValue("uintptr_t", tracker.address + tracker.nodeOffset)
+    if memoryValue("byte", tracker.address + tracker.typeOffset) ~= tracker.historyTag
+        or not finite(power) or power < 5 or power > 8 or power % 1 ~= 0
+        or memoryValue("byte", tracker.address + tracker.powerOffset + 1) ~= (2 ^ power - 1) % 256
+        or not validAddress(base) or base < 65536 then
+        tuner.tableTracker, tuner.tableFaultAt = nil, nil; return nil, false
+    end
+    if tracker.base == base and tracker.power == power and tuner.stateGroup and not tuner.stateFaultAt then return nil, false end
+    local group = trackedNodeGroup(base, 2 ^ power, tracker)
+    if group and selectDashState({ group }, count, published)
+        and memoryValue("uintptr_t", tracker.address + tracker.nodeOffset) == base
+        and memoryValue("byte", tracker.address + tracker.powerOffset) == power then
+        tracker.base, tracker.power, tuner.tableFaultAt = base, power, nil
+        group.lookupSeconds = tick() - began
+        return group, false
+    end
+    tuner.tableFaultAt = tuner.tableFaultAt or now
+    if now - tuner.tableFaultAt < .25 then
+        tuner.status = "Waiting for tracked dash publication"; return nil, true
+    end
+    tuner.tableTracker, tuner.tableFaultAt = nil, nil
+    return nil, false
+end
 local function nearbyDashState(tuner, count, published)
     if not tuner.nodeLayouts or not tuner.nodeAnchor or tuner.nodeAttempted then return nil, false end
     local search = tuner.nodeSearch
@@ -476,8 +612,19 @@ local function bindDashState(tuner, group, count)
     tuner.stateValidatedCount = count
     tuner.nodeSearch, tuner.nodeAttempted = nil, nil
     learnDashNodes(tuner, group, count)
-    log((group.portable and "Confirmed portable dash nodes @" or group.localNodes and "Confirmed nearby dash nodes @" or group.correlated and "Confirmed dash timers by natural descent @" or "Confirmed complete dash state @")
-        .. tostring(tuner.pinned.tbl) .. "; count " .. count)
+    if group.tracked then
+        for i = #tuner.stateGroups, 1, -1 do
+            if tonumber(tuner.stateGroups[i].cooldown.addr) == group.cooldown.addr then table.remove(tuner.stateGroups, i) end
+        end
+        table.insert(tuner.stateGroups, 1, group)
+        if #tuner.stateGroups > 32 then table.remove(tuner.stateGroups) end
+    else prepareDashTracking(tuner, group) end
+    if group.tracked then
+        log(string.format("Followed dash table @%s; count %s; lookup %.3fms", tostring(tuner.pinned.tbl), count, (group.lookupSeconds or 0) * 1000))
+    else
+        log((group.portable and "Confirmed portable dash nodes @" or group.localNodes and "Confirmed nearby dash nodes @" or group.correlated and "Confirmed dash timers by natural descent @" or "Confirmed complete dash state @")
+            .. tostring(tuner.pinned.tbl) .. "; count " .. count)
+    end
 end
 local function observeSplitDashState(tuner, count, published)
 
@@ -527,11 +674,16 @@ local function dashStateStep(tuner, object, now)
     local mode = attr(object, "MovementState")
     local idle = ready and published <= 0 and mode ~= "Boosting" and mode ~= "Dashing" and mode ~= "Recovering"
     if idle then tuner.stateReadyAt = tuner.stateReadyAt or now else tuner.stateReadyAt = nil end
+    dashTrackingSearchStep(tuner, count, published)
+    local tracked, trackingPending = trackedDashState(tuner, count, published, now)
+    if tracked then bindDashState(tuner, tracked, count)
+    elseif trackingPending then return end
     if not tuner.stateGroup and tuner.portableScan then
         local portable, pending = portableDashState(tuner, count, published)
         if portable then bindDashState(tuner, portable, count)
         elseif pending then return end
     end
+    if not tuner.stateGroup and tuner.trackerSearch then tuner.status = "Identifying stable dash table"; return end
 
     if tuner.stateLost and tuner.stateGroups then
         local cached = selectDashState(tuner.stateGroups, count, published)
@@ -556,11 +708,22 @@ local function dashStateStep(tuner, object, now)
         if not idle and not tuner.stateRefreshActive then tuner.status = "Wait for a natural ready state to scan"; return end
 
         local began = tick()
-        local entries = getgc({ "cooldown", "dashCount", "dashRemaining", "recoveryRemaining" })
+        local entries = getgc({ "cooldown", "dashCount", "dashRemaining", "recoveryRemaining", "travelHistory" })
         assert(type(entries) == "table", "Dash state scan failed")
         local owners, keys = {}, { cooldown = true, dashCount = true, dashRemaining = true, recoveryRemaining = true }
+        tuner.historySeeds = {}
         for _, entry in ipairs(entries) do
             local owner, address = tonumber(entry.tbl), tonumber(entry.addr)
+            if entry.key == "travelHistory" and validAddress(address) then
+                local tag = memoryValue("int", address + 12)
+                if tag == 7 or tag == 8 then
+                    local reference = nodeKey(address, "travelHistory", nil, tag)
+                    local history = reference and memoryValue("uintptr_t", address)
+                    if validAddress(history) and history >= 65536 then
+                        tuner.historySeeds[#tuner.historySeeds + 1] = { history = history, historyRef = reference, historyTag = tag }
+                    end
+                end
+            end
             if keys[entry.key] and entry.type == "number" and validAddress(owner) and validAddress(address) then
                 local group = owners[owner]
                 if not group then group = {}; owners[owner] = group end
@@ -584,7 +747,9 @@ local function dashStateStep(tuner, object, now)
             retain(group)
         end
         tuner.stateGroups = retained
-        if not selectDashState(tuner.stateGroups, count, published) then preparePortableDash(tuner, entries) end
+        if not selectDashState(tuner.stateGroups, count, published) then
+            preparePortableDash(tuner, entries); prepareDashTracking(tuner)
+        end
         now = tick()
         tuner.nextStateScan = now + 1
         tuner.stateGroup, tuner.gates, tuner.pinned, tuner.stateLost = nil, nil, nil, nil
@@ -941,4 +1106,4 @@ connection = run.RenderStepped:Connect(function()
     local success, err = pcall(step)
     if not success then log("Runtime error: " .. tostring(err)); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.14 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.15 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))

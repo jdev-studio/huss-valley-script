@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.15 - 2026-10-04
+
+- Track the verified MovementModel table header through its movement-history link. Moving timer storage now follows the header's current pointer before the old address-fault delay or a full scan.
+- Learn shuffled header layouts at runtime and inspect only the active table's small node array. This avoids relying on undocumented owner IDs or readable string hashes for this path.
+- Verify all five field identities, private dash count, history link and storage pointer before writes. Publication races retry, and ambiguous or invalid headers retain the fallback.
+- Log direct lookup time when timer storage changes.
+- The old release fails the new tracking regression. The new build recovers 120 distant relocations on the next render step across three simulated header layouts, with no additional GC scans. The captured controller, relocation, portability and GitHub JDUI/config suites also pass.
+- Live verification: the same table/header and history link survived a node-storage move; lookup at dash 210 took 0.259 ms. The retained log records consecutive successful re-arms from dashes 182–211 with no fallback scan, and the user reported the pauses stopped.
+
 ## 0.6.14 - 2026-10-04
 
 - Fix dash identification when Matcha returns numeric GC entries without a common `tbl` owner. The fallback verifies actual hash-table field names, numeric types, live dash count and timers instead of relying on owner metadata.
