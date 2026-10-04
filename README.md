@@ -5,7 +5,7 @@ Huss Valley movement and dash controls for Matcha. The menu is [JDUI](https://gi
 ## Running it
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/jdev-studio/huss-valley-script/refs/heads/main/Valley"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/jdev-studio/huss-valley-script/main/Valley"))()
 ```
 
 Written against Matcha, with its Drawing API, keyboard/focus functions and memory/GC APIs. Settings require `readfile` and `writefile`. Dash tuning requires Matcha's unsafe Lua execution option to enable the memory APIs.
