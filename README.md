@@ -1,6 +1,6 @@
 # huss-valley-script
 
-Huss Valley movement and dash controls for Matcha. The menu is [JDUI](https://github.com/jdev-studio/jdui), downloaded directly from GitHub on every run.
+Huss Valley movement and dash controls for Matcha. The menu is [JDUI](https://github.com/jdev-studio/jdui), downloaded directly from GitHub on every run. The script uses a tested 1.0.7 revision so every PC loads the same library; local JDUI files are never used.
 
 ## Running it
 
@@ -25,7 +25,9 @@ The script identifies the private dash timers and learns the MovementModel table
 
 Look for `Dash table tracking enabled` in the console. Relocation recovery logs `Followed dash table` with its lookup time. Initial identification still uses GC. Unsupported or ambiguous headers, lost controller objects and character replacement retain the cached/nearby/full-scan fallback, so those cases can still cause a pause.
 
-If Dash reports a memory access/version error, confirm unsafe Lua execution is enabled in Matcha. Tracking requires `memory_read` and `memory_write` and verifiable table/node metadata. Check the console for `Loaded Huss Valley v0.6.15` to confirm the updated loader result.
+Large node arrays yield between frames on slower PCs; partial results never become write targets. Ambiguous headers use a short backoff, which a new dash count bypasses immediately. Duplicate history entries are discarded before searching. Temporary GC errors retry without switching off dash tuning or changing saved toggles; rejected memory writes still stop the affected tuner.
+
+If Dash reports a memory access/version error, confirm unsafe Lua execution is enabled in Matcha. Tracking requires `memory_read` and `memory_write` and verifiable table/node metadata. Check the console for `Loaded Huss Valley v0.6.16` to confirm the updated loader result. If the script stops, retain the final console lines or `valley_jdui_log.txt` from Matcha's workspace before reloading.
 
 ## Controls
 
@@ -41,4 +43,4 @@ Toggles, sliders, theme and menu key are saved to `huss_valley_config.json` in M
 
 ## Version
 
-Current version: **0.6.15**. See [CHANGELOG.md](CHANGELOG.md).
+Current version: **0.6.16**. See [CHANGELOG.md](CHANGELOG.md).

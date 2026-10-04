@@ -5,10 +5,11 @@ local world = game:GetService("Workspace")
 local run = game:GetService("RunService")
 local me = assert(players.LocalPlayer, "Local player unavailable")
 local ok, ui = pcall(function()
-    local source = game:HttpGet("https://raw.githubusercontent.com/jdev-studio/jdui/refs/heads/main/JDUI")
+    local source = game:HttpGet("https://raw.githubusercontent.com/jdev-studio/jdui/d406250dcb43319cb081dfc6d9d7baa79739f473/JDUI")
     assert(type(source) == "string" and #source > 0, "GitHub JDUI download failed")
 
     source = source:gsub('label%("brand","JDUI",70,25,27,', 'label("brand","Huss Valley",70,29,18,', 1)
+    source = source:gsub('label%("playerName",short%(playerDisplayName,13%),70,26,14,', 'label("brand","Huss Valley",70,26,14,', 1)
     return loadstring(source)()
         or rawget(_G, "JDUI") or getfenv().JDUI
 end)
@@ -24,12 +25,21 @@ local movementStatus = "Off"
 local threatStatus = "Off"
 local nextThreat, nextLabels, nextCooldown, nextLog, lastAlert = 0, 0, 0, 0, -10
 local logLines = {}
+local logDirty, nextLogWrite = false, 0
+local function flushLog(force)
+    if not logDirty or (not force and tick() < nextLogWrite) then return end
+    nextLogWrite = tick() + .25
+    if type(writefile) == "function" then
+        local success = pcall(writefile, "valley_jdui_log.txt", table.concat(logLines, "\n"))
+        if success then logDirty = false end
+    end
+end
 local function log(message)
     local line = tostring(message)
     print("[Valley JDUI] " .. line)
     logLines[#logLines + 1] = line
     if #logLines > 60 then table.remove(logLines, 1) end
-    if type(writefile) == "function" then pcall(writefile, "valley_jdui_log.txt", table.concat(logLines, "\n")) end
+    logDirty = true; flushLog()
 end
 local function read(object, key)
     if not object then return nil end
@@ -90,6 +100,8 @@ local function restoreCooldown(tuner)
     tuner.portableScan, tuner.portableStatus = nil, nil
     tuner.historySeeds, tuner.trackerSearch, tuner.tableTracker, tuner.tableFaultAt = nil, nil, nil, nil
     tuner.trackingHeaders = nil
+    tuner.headerSelection, tuner.nextHeaderSelection, tuner.headerCount = nil, nil, nil
+    tuner.nextGcRetry, tuner.gcFault = nil, nil
 end
 function app.stop()
     if not app.alive then return end
@@ -99,6 +111,7 @@ function app.stop()
     if ui.Alive then ui:Destroy() end
     if rawget(_G, "ValleyJDUI") == app then rawset(_G, "ValleyJDUI", nil) end
     log("Stopped; movement writes ended; settings saved")
+    flushLog(true)
 end
 
 ui.Title = "Huss Valley"
@@ -195,6 +208,24 @@ end
 local function timerRead(entry, limit)
     local success, value = pcall(memory_read, "double", entry.addr)
     if success and finite(value) and value >= 0 and value < (limit or 60) then return value end
+end
+local function scanDashGc(tuner, keys, now)
+    if now < (tuner.nextGcRetry or 0) then return end
+    local success, entries = pcall(getgc, keys)
+    if not success or type(entries) ~= "table" then
+        tuner.nextGcRetry = tick() + 1
+        tuner.status = "Memory scan unavailable; retrying"
+        if not tuner.gcFault then log("Dash scan waiting: " .. tostring(entries)) end
+        tuner.gcFault = true
+        return
+    end
+    if tuner.gcFault then log("Dash memory scan recovered") end
+    tuner.nextGcRetry, tuner.gcFault = nil, nil
+    local valid = {}
+    for _, entry in ipairs(entries) do
+        if type(entry) == "table" then valid[#valid + 1] = entry end
+    end
+    return valid
 end
 local function timerMatches(value, published)
 
@@ -430,20 +461,28 @@ local function portableDashState(tuner, count, published)
     log(string.format("Portable dash lookup: %d verified tables, %d live matches in %.3fs", #scan.groups, matches, tick() - scan.began))
     return selected, false
 end
-local function trackedNodeGroup(base, size, tracker)
-    local group = { localNodes = true, tracked = true }
-    local history
-    for index = 0, size - 1 do
+local function trackedNodeGroup(base, size, tracker, deadline)
+    local scan = tracker.nodeScan
+    if not scan or scan.base ~= base or scan.size ~= size then
+        scan = { base = base, size = size, index = 0, group = { localNodes = true, tracked = true } }
+        tracker.nodeScan = scan
+    end
+    local group, began = scan.group, tick()
+    for index = scan.index, size - 1 do
+        if deadline and index > scan.index and tick() >= deadline then
+            scan.seconds = (scan.seconds or 0) + tick() - began
+            scan.index = index; return nil, true
+        end
         local address = base + index * 32
         local reference = memoryValue("uintptr_t", address + 16)
         if reference == tracker.historyRef then
-            if history or not nodeKey(address, "travelHistory", reference, tracker.historyTag)
-                or memoryValue("uintptr_t", address) ~= tracker.history then return end
-            history = address
+            if scan.history or not nodeKey(address, "travelHistory", reference, tracker.historyTag)
+                or memoryValue("uintptr_t", address) ~= tracker.history then tracker.nodeScan = nil; return end
+            scan.history = address
         else
             for _, name in ipairs(dashKeys) do
                 if reference == tracker.references[name] then
-                    if group[name] or not nodeKey(address, name, reference) then return end
+                    if group[name] or not nodeKey(address, name, reference) then tracker.nodeScan = nil; return end
                     group[name] = { key = name, type = "number", addr = address, tbl = tracker.address,
                         localNode = true, keyRef = reference, tableAddress = tracker.address,
                         nodeOffset = tracker.nodeOffset, nodeBase = base }
@@ -451,8 +490,10 @@ local function trackedNodeGroup(base, size, tracker)
             end
         end
     end
-    if not history then return end
+    tracker.nodeScan = nil
+    if not scan.history then return end
     for _, name in ipairs(dashKeys) do if not group[name] then return end end
+    group.lookupSeconds = (scan.seconds or 0) + tick() - began
     return group
 end
 local function prepareDashTracking(tuner, group)
@@ -473,7 +514,23 @@ local function dashTrackingSearchStep(tuner, count, published)
     if not search then return end
     local began = tick()
     for attempt = 1, 128 do
-        if search.seed > #search.seeds or (attempt > 1 and tick() - began >= .002) then break end
+        if (search.seed > #search.seeds and not search.pending) or (attempt > 1 and tick() - began >= .002) then break end
+        if search.pending then
+            local candidate = search.pending[#search.pending]
+            local tracker = candidate.tracker
+            local group, pending = trackedNodeGroup(candidate.base, candidate.size, tracker, began + .002)
+            if pending then return end
+            table.remove(search.pending)
+            if #search.pending == 0 then search.pending = nil end
+            if group and search.expected then
+                for _, name in ipairs(dashKeys) do
+                    if group[name].addr ~= search.expected[name] then group = nil; break end
+                end
+            end
+            if group and not search.matched[tracker.address] then
+                search.matched[tracker.address] = true; search.matches[#search.matches + 1] = tracker
+            end
+        else
         local seed, cursor = search.seeds[search.seed], search.cursor
         local offset = math.ceil(cursor / 2) * 8 * (cursor % 2 == 0 and -1 or 1)
         local address = seed.history + offset
@@ -494,15 +551,8 @@ local function dashTrackingSearchStep(tuner, count, published)
                                     local tracker = { address = address, typeOffset = typeOffset, powerOffset = powerOffset,
                                         nodeOffset = nodeOffset, history = seed.history, historyRef = seed.historyRef,
                                         historyTag = seed.historyTag, references = search.references }
-                                    local group = trackedNodeGroup(base, 2 ^ power, tracker)
-                                    if group and search.expected then
-                                        for _, name in ipairs(dashKeys) do
-                                            if group[name].addr ~= search.expected[name] then group = nil; break end
-                                        end
-                                    end
-                                    if group and not search.matched[address] then
-                                        search.matched[address] = true; search.matches[#search.matches + 1] = tracker
-                                    end
+                                    search.pending = search.pending or {}
+                                    search.pending[#search.pending + 1] = { tracker = tracker, base = base, size = 2 ^ power }
                                 end
                             end
                         end
@@ -510,31 +560,55 @@ local function dashTrackingSearchStep(tuner, count, published)
                 end
             end
         end
+        end
     end
-    if search.seed <= #search.seeds then return end
+    if search.seed <= #search.seeds or search.pending then return end
     tuner.trackerSearch = nil
     tuner.trackingHeaders = search.matches
+    tuner.headerSelection, tuner.nextHeaderSelection, tuner.headerCount = nil, nil, nil
     log("Dash table tracking: " .. #search.matches .. " verified headers")
 end
-local function selectTrackedHeader(tuner, count, published)
-    local selected, matches = nil, 0
-    for _, tracker in ipairs(tuner.trackingHeaders or {}) do
+local function selectTrackedHeader(tuner, count, published, deadline)
+    if not tuner.trackingHeaders then return end
+    if tuner.headerCount ~= count then tuner.nextHeaderSelection = nil end
+    tuner.headerCount = count
+    if tick() < (tuner.nextHeaderSelection or 0) then return end
+    local probe = tuner.headerSelection or { index = 1, groups = {}, trackers = {} }
+    tuner.headerSelection = probe
+    for index = probe.index, #tuner.trackingHeaders do
+        if index > probe.index and tick() >= deadline then probe.index = index; return nil, true end
+        local tracker = tuner.trackingHeaders[index]
         local power = memoryValue("byte", tracker.address + tracker.powerOffset)
         local base = memoryValue("uintptr_t", tracker.address + tracker.nodeOffset)
         if finite(power) and power >= 5 and power <= 8 and power % 1 == 0 and validAddress(base)
             and memoryValue("byte", tracker.address + tracker.typeOffset) == tracker.historyTag
             and memoryValue("byte", tracker.address + tracker.powerOffset + 1) == (2 ^ power - 1) % 256 then
-            local group = trackedNodeGroup(base, 2 ^ power, tracker)
-            if group and selectDashState({ group }, count, published) then selected, matches = tracker, matches + 1 end
+            local group, pending = trackedNodeGroup(base, 2 ^ power, tracker, deadline)
+            if pending then probe.index = index; return nil, true end
+            if group then
+                probe.groups[#probe.groups + 1] = group
+                probe.trackers[group] = { tracker = tracker, base = base, power = power }
+            end
         end
     end
-    if matches ~= 1 then return end
+    tuner.headerSelection, tuner.nextHeaderSelection = nil, tick() + .25
+    local group = selectDashState(probe.groups, count, published)
+    local match = group and probe.trackers[group]
+    if not match then return end
+    local selected = match.tracker
+    if memoryValue("uintptr_t", selected.address + selected.nodeOffset) ~= match.base
+        or memoryValue("byte", selected.address + selected.powerOffset) ~= match.power then return end
+    selected.selectionGroup, selected.selectionBase, selected.selectionPower = group, match.base, match.power
     tuner.tableTracker, tuner.trackingHeaders = selected, nil
     log("Dash table tracking enabled @" .. selected.address .. "; verified header and history link")
 end
 local function trackedDashState(tuner, count, published, now)
     local began = tick()
-    if not tuner.tableTracker then selectTrackedHeader(tuner, count, published) end
+    local deadline = began + .006
+    if not tuner.tableTracker then
+        local _, pending = selectTrackedHeader(tuner, count, published, deadline)
+        if pending then return nil, false end
+    end
     local tracker = tuner.tableTracker
     if not tracker then return nil, false end
     local power = memoryValue("byte", tracker.address + tracker.powerOffset)
@@ -546,12 +620,16 @@ local function trackedDashState(tuner, count, published, now)
         tuner.tableTracker, tuner.tableFaultAt = nil, nil; return nil, false
     end
     if tracker.base == base and tracker.power == power and tuner.stateGroup and not tuner.stateFaultAt then return nil, false end
-    local group = trackedNodeGroup(base, 2 ^ power, tracker)
+    local group, pending
+    if tracker.selectionBase == base and tracker.selectionPower == power then group = tracker.selectionGroup end
+    tracker.selectionGroup, tracker.selectionBase, tracker.selectionPower = nil, nil, nil
+    if not group then group, pending = trackedNodeGroup(base, 2 ^ power, tracker, deadline) end
+    if pending then tuner.status = "Refreshing verified dash table"; return nil, true end
     if group and selectDashState({ group }, count, published)
         and memoryValue("uintptr_t", tracker.address + tracker.nodeOffset) == base
         and memoryValue("byte", tracker.address + tracker.powerOffset) == power then
         tracker.base, tracker.power, tuner.tableFaultAt = base, power, nil
-        group.lookupSeconds = tick() - began
+        group.lookupSeconds = math.max(group.lookupSeconds or 0, tick() - began)
         return group, false
     end
     tuner.tableFaultAt = tuner.tableFaultAt or now
@@ -708,10 +786,11 @@ local function dashStateStep(tuner, object, now)
         if not idle and not tuner.stateRefreshActive then tuner.status = "Wait for a natural ready state to scan"; return end
 
         local began = tick()
-        local entries = getgc({ "cooldown", "dashCount", "dashRemaining", "recoveryRemaining", "travelHistory" })
-        assert(type(entries) == "table", "Dash state scan failed")
+        local entries = scanDashGc(tuner, { "cooldown", "dashCount", "dashRemaining", "recoveryRemaining", "travelHistory" }, now)
+        if not entries then return end
         local owners, keys = {}, { cooldown = true, dashCount = true, dashRemaining = true, recoveryRemaining = true }
         tuner.historySeeds = {}
+        local histories = {}
         for _, entry in ipairs(entries) do
             local owner, address = tonumber(entry.tbl), tonumber(entry.addr)
             if entry.key == "travelHistory" and validAddress(address) then
@@ -719,7 +798,9 @@ local function dashStateStep(tuner, object, now)
                 if tag == 7 or tag == 8 then
                     local reference = nodeKey(address, "travelHistory", nil, tag)
                     local history = reference and memoryValue("uintptr_t", address)
-                    if validAddress(history) and history >= 65536 then
+                    local signature = tostring(history) .. ":" .. tostring(reference) .. ":" .. tostring(tag)
+                    if validAddress(history) and history >= 65536 and not histories[signature] then
+                        histories[signature] = true
                         tuner.historySeeds[#tuner.historySeeds + 1] = { history = history, historyRef = reference, historyTag = tag }
                     end
                 end
@@ -838,8 +919,8 @@ local function dashCooldownStep(tuner, object, now)
     end
     if tuner.dashCount == nil or (tuner.refreshPending and ready and published <= 0) then
 
-        local entries = getgc("cooldown")
-        assert(type(entries) == "table", "Internal timer scan failed")
+        local entries = scanDashGc(tuner, "cooldown", now)
+        if not entries then return end
         tuner.cache = {}
         local seen = {}
         for _, entry in ipairs(entries) do
@@ -1081,6 +1162,7 @@ end
 local function step()
     if not app.alive then return end
     if not ui.Alive then app.stop(); return end
+    flushLog()
     local now = tick()
     local c = read(me, "Character")
     local root = child(c, "HumanoidRootPart")
@@ -1106,4 +1188,4 @@ connection = run.RenderStepped:Connect(function()
     local success, err = pcall(step)
     if not success then log("Runtime error: " .. tostring(err)); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.15 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.16 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))

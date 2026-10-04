@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.16 - 2026-10-05
+
+- Retry temporary GC exceptions and invalid scan results without permanently disabling dash tuning or changing saved toggles. Both timer-only and release re-arm modes recover automatically; failed scans never write memory.
+- Bound node-array verification during header discovery, header selection and storage relocation. Slow lookups resume from partial work, and a changed storage pointer discards that work before rebinding.
+- Back off unchanged ambiguous headers instead of inspecting their full arrays every frame. A new dash count bypasses the backoff immediately. Deduplicate history seeds and ignore malformed GC entries while retaining valid controller data.
+- Batch log file writes at 250 ms intervals while retaining console messages and flushing the final log on stop/reload.
+- Download the tested GitHub JDUI 1.0.7 commit on every run, preserving Huss Valley branding with the updated sidebar. No local JDUI dependency and no gameplay controls removed.
+- Regression proof: 120 distant relocations still recover on their first render step. A simulated slow-read 256-node refresh completes over four callbacks, each at most 6.080 ms. Partial pointer replacement, ambiguous headers, scan failures, the captured controller, portability, movement, cooldowns, alerts and saved configs all pass.
+- The affected users' exact stop errors were unavailable, so live confirmation of those reports remains pending.
+
 ## 0.6.15 - 2026-10-04
 
 - Track the verified MovementModel table header through its movement-history link. Moving timer storage now follows the header's current pointer before the old address-fault delay or a full scan.
