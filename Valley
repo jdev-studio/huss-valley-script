@@ -1,5 +1,3 @@
--- Matcha: movement tuning, cooldown controls and optional catcher alerts.
--- Load in Matcha. Saved settings restore on reload; closing JDUI stops the script.
 local previous = rawget(_G, "ValleyJDUI")
 if previous and previous.stop then pcall(previous.stop) end
 local players = game:GetService("Players")
@@ -9,7 +7,7 @@ local me = assert(players.LocalPlayer, "Local player unavailable")
 local ok, ui = pcall(function()
     local source = game:HttpGet("https://raw.githubusercontent.com/jdev-studio/jdui/refs/heads/main/JDUI")
     assert(type(source) == "string" and #source > 0, "GitHub JDUI download failed")
-    -- Public JDUI 1.0.6 has a fixed brand label rather than a SetTitle method.
+
     source = source:gsub('label%("brand","JDUI",70,25,27,', 'label("brand","Huss Valley",70,29,18,', 1)
     return loadstring(source)()
         or rawget(_G, "JDUI") or getfenv().JDUI
@@ -89,6 +87,7 @@ local function restoreCooldown(tuner)
     tuner.stateRefreshActive = nil
     tuner.stateCandidates, tuner.stateObserved, tuner.stateProbeCount, tuner.stateValidatedCount = nil, nil, nil, nil
     tuner.nodeLayouts, tuner.nodeAnchor, tuner.nodeSearch, tuner.nodeAttempted = nil, nil, nil, nil
+    tuner.portableScan, tuner.portableStatus = nil, nil
 end
 function app.stop()
     if not app.alive then return end
@@ -190,17 +189,13 @@ local function cooldownWrite(tuner, key, value)
     local after = attr(tuner.object, key)
     return after == value or (finite(after) and finite(value) and math.abs(after - value) < .001)
 end
--- CharacterMovementClient publishes attributes from MovementModel's private
--- timer. Writing those attributes cannot change canBoost(). Locate only the
--- numeric 'cooldown' entry that follows this character's natural dash across
--- three different published timer values. Keep a confirmed address for later
--- dashes on this character. Never write every matching GC key.
+
 local function timerRead(entry, limit)
     local success, value = pcall(memory_read, "double", entry.addr)
     if success and finite(value) and value >= 0 and value < (limit or 60) then return value end
 end
 local function timerMatches(value, published)
-    -- Attributes are published every .1 s, so live memory may be slightly ahead.
+
     return finite(value) and value <= published + .015 and published - value <= .16
 end
 local dashKeys = { "cooldown", "dashCount", "dashRemaining", "recoveryRemaining" }
@@ -209,8 +204,7 @@ local function memoryValue(kind, address)
     if success then return value end
 end
 local function nodeKey(address, key, reference)
-    -- This node format was read directly from the live, GC-identified state.
-    -- Enable the fast path only when every field's type and exact name prove it.
+
     local pointer = memoryValue("uintptr_t", address + 16)
     if not validAddress(pointer) or pointer < 65536 or (reference and pointer ~= reference) then return end
     local tag = memoryValue("int", address + 28)
@@ -224,8 +218,7 @@ local function learnDashNodes(tuner, group, count)
     for _, name in ipairs(dashKeys) do
         local entry = group[name]
         if not entry and name == "dashCount" then
-            -- Split GC ownership can hide the counter. Read nearby nodes only;
-            -- require a unique exact key with this character's private count.
+
             for offset = -1024, 1024, 32 do
                 local address = base + offset
                 if nodeKey(address, name) and timerRead({ addr = address }, 1e12) == count then
@@ -275,8 +268,7 @@ end
 local function dashRearmStep(tuner, object, now)
     if not tuner.rearm or tuner.seconds ~= 0 or not tuner.pinned or not tuner.applied
         or tuner.corrected or tuner.rearmedCount == tuner.dashCount then return end
-    -- Matcha's observed GC descriptors include their owning table address.
-    -- Require it plus the game's dash count; never guess offsets or patch all keys.
+
     local owner = tonumber(tuner.pinned.tbl)
     if not validAddress(owner) then tuner.status = "Re-arm unavailable: GC table owner missing"; return end
     if type(iskeypressed) ~= "function" or type(isrbxactive) ~= "function" then
@@ -307,8 +299,7 @@ local function dashRearmStep(tuner, object, now)
         tuner.status = "Re-arm state changed; retry next frame"; return
     end
     if motion == 0 and recovery == 0 then tuner.rearmedCount = count; return end
-    -- A GC scan may outlast a key transition. Check fresh input and count again
-    -- before cancelling motion, so an intervening press is not cut short.
+
     focusOK, focused = pcall(isrbxactive)
     keyOK, held = pcall(iskeypressed, 0x20)
     if not focusOK or focused ~= true or not keyOK or held ~= false
@@ -334,6 +325,106 @@ local function selectDashState(groups, count, published)
     end
     return matches == 1 and selected or nil, matches
 end
+local function hashDashField(base, size, reference, name)
+    local hash = memoryValue("int", reference + 16)
+    if not finite(hash) or hash % 1 ~= 0 then return end
+    local index, visited = hash % size, {}
+    for _ = 1, 8 do
+        if index < 0 or index >= size or visited[index] then return end
+        visited[index] = true
+        local address = base + index * 32
+        local pointer = memoryValue("uintptr_t", address + 16)
+        local tag = memoryValue("int", address + 28)
+        if not finite(tag) or tag % 1 ~= 0 or tag % 16 == 0 then return end
+        if pointer == reference then
+            if nodeKey(address, name, reference) then return address end
+            return
+        end
+        local nextIndex = math.floor(tag / 16)
+        if nextIndex == 0 then return end
+        index = index + nextIndex
+    end
+end
+local function preparePortableDash(tuner, entries)
+    if type(memory_write) ~= "function" then
+        tuner.portableStatus = "GC grouping unavailable; enable memory writes in Matcha"; return
+    end
+    local references, seeds, seen = {}, {}, {}
+    local keys = { cooldown = true, dashCount = true, dashRemaining = true, recoveryRemaining = true }
+    for _, entry in ipairs(entries) do
+        local address = tonumber(entry.addr)
+        if keys[entry.key] and entry.type == "number" and validAddress(address) then
+            local reference = nodeKey(address, entry.key)
+            if reference then
+                if references[entry.key] and references[entry.key] ~= reference then
+                    tuner.portableStatus = "Multiple Lua key namespaces; no unverified write"; return
+                end
+                references[entry.key] = reference
+                if entry.key == "cooldown" and not seen[address] then
+                    seeds[#seeds + 1] = address; seen[address] = true
+                end
+            end
+        end
+    end
+    for _, name in ipairs(dashKeys) do
+        if not references[name] then
+            tuner.portableStatus = "Cannot verify " .. name .. " nodes; check Matcha memory access/version"; return
+        end
+    end
+    tuner.portableStatus = nil
+    tuner.portableScan = { references = references, seeds = seeds, seed = 1, power = 5, index = 0,
+        groups = {}, seen = {}, began = tick() }
+end
+local function portableDashState(tuner, count, published)
+    local scan = tuner.portableScan
+    if not scan then return nil, false end
+    local began = tick()
+    for attempt = 1, 128 do
+        if scan.seed > #scan.seeds or (attempt > 1 and tick() - began >= .003) then break end
+        local size = 2 ^ scan.power
+        local seed = scan.seeds[scan.seed]
+        local base = seed - scan.index * 32
+        scan.index = scan.index + 1
+        if scan.index >= size then
+            scan.index = 0; scan.power = scan.power + 1
+            if scan.power > 7 then scan.power = 5; scan.seed = scan.seed + 1 end
+        end
+        if hashDashField(base, size, scan.references.cooldown, "cooldown") == seed then
+            local group, addresses = { localNodes = true, portable = true }, {}
+            for _, name in ipairs(dashKeys) do
+                local address = hashDashField(base, size, scan.references[name], name)
+                if not address then group = nil; break end
+                group[name] = { key = name, type = "number", vtt = 3, addr = address,
+                    tbl = base, localNode = true, keyRef = scan.references[name] }
+                addresses[#addresses + 1] = tostring(address)
+            end
+            if group then
+                local signature = table.concat(addresses, ":")
+                if not scan.seen[signature] then
+                    scan.seen[signature] = true; scan.groups[#scan.groups + 1] = group
+                end
+            end
+        end
+    end
+    if scan.seed <= #scan.seeds then tuner.status = "Identifying dash tables without GC owner metadata"; return nil, true end
+    for _, group in ipairs(scan.groups) do
+        local existing
+        for i, cached in ipairs(tuner.stateGroups) do
+            local same = true
+            for _, name in ipairs(dashKeys) do
+                if tonumber(cached[name] and cached[name].addr) ~= group[name].addr then same = false; break end
+            end
+            if same then existing = i; break end
+        end
+        if existing then tuner.stateGroups[existing] = group
+        else tuner.stateGroups[#tuner.stateGroups + 1] = group end
+    end
+    tuner.portableScan = nil
+    local selected, matches = selectDashState(scan.groups, count, published)
+    tuner.portableStatus = #scan.groups == 0 and "No verified dash table; check Matcha memory access/version" or nil
+    log(string.format("Portable dash lookup: %d verified tables, %d live matches in %.3fs", #scan.groups, matches, tick() - scan.began))
+    return selected, false
+end
 local function nearbyDashState(tuner, count, published)
     if not tuner.nodeLayouts or not tuner.nodeAnchor or tuner.nodeAttempted then return nil, false end
     local search = tuner.nodeSearch
@@ -353,8 +444,7 @@ local function nearbyDashState(tuner, count, published)
                 for _, name in ipairs(dashKeys) do
                     local address = base + layout.offsets[name]
                     if not nodeKey(address, name, layout.references[name]) then group = nil; break end
-                    -- tbl is a consistency token for these four validated nodes;
-                    -- it is not presented as an actual Lua table-header address.
+
                     group[name] = { key = name, type = "number", vtt = 3, addr = address,
                         tbl = base, localNode = true, keyRef = layout.references[name] }
                 end
@@ -378,8 +468,7 @@ local function nearbyDashState(tuner, count, published)
     return selected, false
 end
 local function bindDashState(tuner, group, count)
-    -- A previous successful write belongs to the previous binding, even if the
-    -- game keeps the dash count unchanged while rebuilding or reusing its state.
+
     tuner.completed, tuner.applied, tuner.corrected, tuner.writtenEntry, tuner.appliedAt = false, nil, nil, nil, nil
     tuner.rearmedCount = nil
     tuner.stateGroup, tuner.gates, tuner.pinned = group, group, group.cooldown
@@ -387,13 +476,11 @@ local function bindDashState(tuner, group, count)
     tuner.stateValidatedCount = count
     tuner.nodeSearch, tuner.nodeAttempted = nil, nil
     learnDashNodes(tuner, group, count)
-    log((group.localNodes and "Confirmed nearby dash nodes @" or group.correlated and "Confirmed dash timers by natural descent @" or "Confirmed complete dash state @")
+    log((group.portable and "Confirmed portable dash nodes @" or group.localNodes and "Confirmed nearby dash nodes @" or group.correlated and "Confirmed dash timers by natural descent @" or "Confirmed complete dash state @")
         .. tostring(tuner.pinned.tbl) .. "; count " .. count)
 end
 local function observeSplitDashState(tuner, count, published)
-    -- Live Matcha scans can assign the count and three timers different tbl IDs.
-    -- Keep the timer ownership requirement, then identify one timer group by
-    -- three descending game-published observations during a natural moving dash.
+
     local available = false
     for _, group in ipairs(tuner.stateGroups or {}) do if not group.dashCount then available = true end end
     if not available then return nil, false end
@@ -440,8 +527,12 @@ local function dashStateStep(tuner, object, now)
     local mode = attr(object, "MovementState")
     local idle = ready and published <= 0 and mode ~= "Boosting" and mode ~= "Dashing" and mode ~= "Recovering"
     if idle then tuner.stateReadyAt = tuner.stateReadyAt or now else tuner.stateReadyAt = nil end
-    -- Try known descriptors before any expensive refresh. Published and private
-    -- counts can briefly arrive in either order, even though the table is valid.
+    if not tuner.stateGroup and tuner.portableScan then
+        local portable, pending = portableDashState(tuner, count, published)
+        if portable then bindDashState(tuner, portable, count)
+        elseif pending then return end
+    end
+
     if tuner.stateLost and tuner.stateGroups then
         local cached = selectDashState(tuner.stateGroups, count, published)
         if cached then bindDashState(tuner, cached, count) end
@@ -450,8 +541,7 @@ local function dashStateStep(tuner, object, now)
             cached, waiting = observeSplitDashState(tuner, count, published)
             if cached then bindDashState(tuner, cached, count)
             elseif waiting and now - (tuner.stateFaultAt or now) < .7 then
-                -- Calibrate known timer triples before blocking on a full heap scan.
-                -- Three natural observations still establish identity; no writes yet.
+
                 return
             end
         end
@@ -464,8 +554,7 @@ local function dashStateStep(tuner, object, now)
     if not tuner.stateGroups or (tuner.stateLost and (tuner.stateRefreshActive or (idle and now - tuner.stateReadyAt >= .15))
         and now >= (tuner.nextStateScan or 0)) then
         if not idle and not tuner.stateRefreshActive then tuner.status = "Wait for a natural ready state to scan"; return end
-        -- Initial scans wait for idle. Confirmed invalid addresses recover during
-        -- motion too; waiting for natural readiness creates repeated normal dashes.
+
         local began = tick()
         local entries = getgc({ "cooldown", "dashCount", "dashRemaining", "recoveryRemaining" })
         assert(type(entries) == "table", "Dash state scan failed")
@@ -495,18 +584,19 @@ local function dashStateStep(tuner, object, now)
             retain(group)
         end
         tuner.stateGroups = retained
+        if not selectDashState(tuner.stateGroups, count, published) then preparePortableDash(tuner, entries) end
         now = tick()
         tuner.nextStateScan = now + 1
         tuner.stateGroup, tuner.gates, tuner.pinned, tuner.stateLost = nil, nil, nil, nil
         tuner.stateRefreshActive, tuner.stateFaultAt = nil, nil
         tuner.nodeSearch, tuner.nodeAttempted = nil, nil
-        -- The rebuilt state can have the same dash count but a new live timer.
-        -- The old address's successful write does not apply to the fresh address.
+
         tuner.completed, tuner.applied, tuner.corrected, tuner.writtenEntry, tuner.appliedAt = false, nil, nil, nil, nil
         tuner.stateProbeCount, tuner.stateCandidates, tuner.stateObserved = nil, nil, nil
         count, published, ready = attr(object, "DashCount"), attr(object, "DashCooldown"), attr(object, "DashReady")
         log(string.format("Dash state scan: %d timer groups in %.2fs; game count %s", #tuner.stateGroups, now - began, tostring(count)))
         if id(read(me, "Character")) ~= id(object) or not finite(count) or not finite(published) or type(ready) ~= "boolean" then return end
+        if tuner.portableScan then tuner.status = "Identifying dash tables without GC owner metadata"; return end
     end
     if count ~= tuner.dashCount then
         tuner.dashCount, tuner.started, tuner.completed = count, now, false
@@ -517,9 +607,8 @@ local function dashStateStep(tuner, object, now)
         local waiting = false
         if not selected and matches == 0 then selected, waiting = observeSplitDashState(tuner, count, published) end
         if not selected then
-            if not waiting then tuner.status = matches > 1 and "Dash state ambiguous; dash once to identify" or "Dash state missing; refresh when naturally ready" end
-            -- A known state was rejected: calibration waiting must not cancel
-            -- its pending refresh before readiness has had time to settle.
+            if not waiting then tuner.status = tuner.portableStatus or (matches > 1 and "Dash state ambiguous; dash once to identify" or "Dash state missing; refresh when naturally ready") end
+
             tuner.stateLost = tuner.stateFaultAt ~= nil or (matches == 0 and not waiting)
             return
         end
@@ -542,8 +631,7 @@ local function dashStateStep(tuner, object, now)
         tuner.stateValidatedCount, correlated = count, true
     end
     if actualCount ~= count or not cooldown or not motion or not recovery or not correlated then
-        -- Skip writes during brief publication/read races without discarding
-        -- a confirmed table. Only a persistent mismatch needs a fresh scan.
+
         tuner.stateFaultAt = tuner.stateFaultAt or now
         tuner.status = "Waiting for consistent dash state; keeping cache"
         local invalidAddress = (actualCount ~= nil and actualCount % 1 ~= 0)
@@ -551,8 +639,7 @@ local function dashStateStep(tuner, object, now)
             or (actualCount == nil and motion == nil)
         if now - tuner.stateFaultAt < (invalidAddress and .05 or .25) then return end
         tuner.stateGroup, tuner.gates, tuner.pinned, tuner.stateLost = nil, nil, nil, true
-        -- A correlated group reading all zeros while the game still publishes
-        -- a positive new cooldown is stale after the publication grace period.
+
         tuner.stateRefreshActive = invalidAddress or (not correlated and published > .16
             and cooldown == 0 and motion == 0 and recovery == 0)
         if tuner.stateRefreshActive then tuner.nextStateScan = now end
@@ -585,7 +672,7 @@ local function dashCooldownStep(tuner, object, now)
         tuner.status = "Dash state unavailable"; return
     end
     if tuner.dashCount == nil or (tuner.refreshPending and ready and published <= 0) then
-        -- Scan while idle, then use cheap reads as the next natural dash runs.
+
         local entries = getgc("cooldown")
         assert(type(entries) == "table", "Internal timer scan failed")
         tuner.cache = {}
@@ -630,8 +717,7 @@ local function dashCooldownStep(tuner, object, now)
                 end
                 tuner.status = ready and "Dash ready (game reported)" or "Timer shortened; motion/recovery active"
             elseif now - tuner.appliedAt < .3 then
-                -- Attributes lag private state by .1 s. A stale published value
-                -- is not evidence that the game corrected the actual timer.
+
                 tuner.status = "Waiting for game timer update"
             else
                 tuner.pinned = nil
@@ -643,7 +729,7 @@ local function dashCooldownStep(tuner, object, now)
         return
     end
     if published <= 0 or ready then
-        -- DashCount may be visible before the other attributes in the batch.
+
         if now - tuner.started < .15 then tuner.status = "Waiting for dash timer"; return end
         tuner.completed = true; tuner.status = "Natural timer finished"; return
     end
@@ -653,7 +739,7 @@ local function dashCooldownStep(tuner, object, now)
         if actual and actual > 0 and timerMatches(actual, published) then
             applyDashCap(tuner, tuner.pinned, actual, now); return
         end
-        -- A replaced timer must be identified again; never write a stale pointer.
+
         tuner.pinned = nil
         tuner.refreshPending = true
         log("Confirmed dash timer changed; identifying again")
@@ -689,9 +775,7 @@ local function dashCooldownStep(tuner, object, now)
     local candidate = candidates[1]
     local before = timerRead(candidate.entry)
     if not timerMatches(before, published) then tuner.completed = true; tuner.status = "Timer changed; no write"; return end
-    -- Discard addresses on respawn and disable; recheck the confirmed timer
-    -- against the next natural dash before using it again.
-    -- The timer is ephemeral: cleanup must not put an old countdown back.
+
     applyDashCap(tuner, candidate.entry, before, now)
 end
 local function cooldownStep(c, now, dashOnly)
@@ -750,7 +834,7 @@ local function movementDirection(humanoid)
         look = Vector3.new(-components[6], -components[9], -components[12])
         right = Vector3.new(components[4], components[7], components[10])
     end
-    -- Normalize each planar camera axis before combining diagonal input.
+
     local lookLength, rightLength = horizontal(look), horizontal(right)
     if lookLength < .001 or rightLength < .001 then return nil end
     return Vector3.new(look.X / lookLength * forward + right.X / rightLength * side, 0,
@@ -857,4 +941,4 @@ connection = run.RenderStepped:Connect(function()
     local success, err = pcall(step)
     if not success then log("Runtime error: " .. tostring(err)); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.13 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.14 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))

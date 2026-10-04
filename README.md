@@ -21,7 +21,9 @@ Written against Matcha, with its Drawing API, keyboard/focus functions and memor
 
 Set **Dash max cooldown** to `0`, enable **Tune Dash**, and enable **Re-arm dash on Space release**. Release Space after each dash, then change direction and press it again. The game's turn and grounding requirements still apply. Holding Space preserves the current dash motion.
 
-The script identifies the private dash timers and reuses verified addresses. When they change, it checks cached blocks and a bounded nearby region before falling back to a full scan. Field identities and write readback are checked. Full scans can still cause a pause, and game or server changes can limit client tuning.
+The script identifies the private dash timers and reuses verified addresses. Missing or inconsistent GC owner metadata now falls back to live hash-table lookup, checking all four numeric fields and the private dash count before binding. Addresses are discovered on each PC. When they change, it checks cached blocks and a bounded nearby region before falling back to a full scan. Field identities and write readback are checked. Full scans can still cause a pause, and game or server changes can limit client tuning.
+
+If Dash reports a memory access/version error, confirm unsafe Lua execution is enabled in Matcha. The fallback requires `memory_read` and `memory_write` and a verifiable Luau node format. Check the console for `Loaded Huss Valley v0.6.14` to confirm the updated loader result.
 
 ## Controls
 
@@ -37,4 +39,4 @@ Toggles, sliders, theme and menu key are saved to `huss_valley_config.json` in M
 
 ## Version
 
-Current version: **0.6.13**. See [CHANGELOG.md](CHANGELOG.md).
+Current version: **0.6.14**. See [CHANGELOG.md](CHANGELOG.md).
