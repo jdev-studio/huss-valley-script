@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.19 - 2026-10-05
+
+- Fix the startup nil `RunService` / `RenderStepped` error. Retry scheduler discovery for up to 100 yielded attempts, accepting an available global service and Heartbeat when RenderStepped is absent.
+- Share the selected frame signal with GitHub JDUI and the gameplay loop so the fallback supports the full menu and dash functionality.
+- If Matcha exposes no usable frame scheduler, exit before loading JDUI with an attach-and-rerun message instead of a nil-index error. No settings or controls are removed.
+- Reproduce the original nil-service failure and verify late-service recovery, missing-service exit, Heartbeat gameplay/config regression, delayed-player startup and dash table tracking in simulation. Affected-PC behavior remains unverified.
+
 ## 0.6.18 - 2026-10-05
 
 - Wait for a ready Roblox player, mouse and camera before loading JDUI. Re-running while waiting replaces the pending startup callback instead of creating duplicate menus.

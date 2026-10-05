@@ -1,10 +1,22 @@
-local function bootstrap()
+local function frameSignal()
+    local success, signal = pcall(function()
+        local run = game:GetService("RunService") or RunService
+        if not run then return end
+        return run.RenderStepped or run.Heartbeat
+    end)
+    if success and signal then
+        local usable, connect = pcall(function() return signal.Connect end)
+        if usable and type(connect) == "function" then return signal end
+    end
+end
+local function bootstrap(frame)
 local previous = rawget(_G, "ValleyJDUI")
 if type(previous) == "table" and type(previous.stop) == "function" then pcall(previous.stop) end
 local players = game:GetService("Players")
 local world = game:GetService("Workspace")
-local run = game:GetService("RunService")
 local me = assert(players.LocalPlayer, "Local player unavailable")
+local previousFrame = rawget(_G, "HussValleyFrameSignal")
+rawset(_G, "HussValleyFrameSignal", frame)
 local ok, ui = pcall(function()
     local source, failure
     for attempt = 1, 2 do
@@ -16,6 +28,10 @@ local ok, ui = pcall(function()
         failure = result
     end
     assert(source, "GitHub JDUI download failed: " .. tostring(failure))
+    local replacements
+    source, replacements = source:gsub('local run=game:GetService%("RunService"%)',
+        'local run={RenderStepped=assert(rawget(_G,"HussValleyFrameSignal"),"Frame scheduler unavailable")}', 1)
+    assert(replacements == 1, "GitHub JDUI scheduler adapter unavailable")
 
     source = source:gsub('label%("brand","JDUI",70,25,27,', 'label("brand","Huss Valley",70,29,18,', 1)
     source = source:gsub('label%("playerName",short%(playerDisplayName,13%),70,26,14,', 'label("brand","Huss Valley",70,26,14,', 1)
@@ -54,6 +70,7 @@ end
     return chunk()
         or rawget(_G, "JDUI") or getfenv().JDUI
 end)
+rawset(_G, "HussValleyFrameSignal", previousFrame)
 assert(ok and type(ui) == "table", "JDUI could not load: " .. tostring(ui))
 local app = { alive = true, ui = ui }
 rawset(_G, "ValleyJDUI", app)
@@ -1137,11 +1154,11 @@ local function step()
         log("Movement " .. movementStatus)
     end
 end
-connection = run.RenderStepped:Connect(function()
+connection = frame:Connect(function()
     local success, err = pcall(step)
     if not success then log("Runtime error: " .. tostring(err)); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.18 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.19 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
@@ -1154,7 +1171,24 @@ local function ready()
     end)
     return success and available == true
 end
-if ready() then bootstrap()
+local frame = frameSignal()
+if not frame then
+    local pause = type(wait) == "function" and wait or (type(task) == "table" and task.wait)
+    if type(pause) == "function" then
+        print("[Valley JDUI] Waiting for Matcha frame scheduler")
+        for attempt = 1, 100 do
+            local success = pcall(pause, .1)
+            if not success then break end
+            frame = frameSignal()
+            if frame then break end
+        end
+    end
+end
+if not frame then
+    print("[Valley JDUI] Startup unavailable: Matcha exposes no frame scheduler. Attach to a loaded Roblox game, then run the loader again.")
+    return
+end
+if ready() then bootstrap(frame)
 else
     local startup = { alive = true }
     local watcher
@@ -1164,10 +1198,10 @@ else
         if rawget(_G, "ValleyJDUIStartup") == startup then rawset(_G, "ValleyJDUIStartup", nil) end
     end
     rawset(_G, "ValleyJDUIStartup", startup)
-    watcher = game:GetService("RunService").RenderStepped:Connect(function()
+    watcher = frame:Connect(function()
         if not startup.alive or not ready() then return end
         startup.stop()
-        local success, failure = pcall(bootstrap)
+        local success, failure = pcall(bootstrap, frame)
         if not success then print("[Valley JDUI] Startup failed: " .. tostring(failure)) end
     end)
     print("[Valley JDUI] Waiting for Roblox player and camera before loading")
