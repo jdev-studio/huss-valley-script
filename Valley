@@ -16,14 +16,12 @@ end)
 assert(ok and type(ui) == "table", "JDUI could not load: " .. tostring(ui))
 local app = { alive = true, ui = ui }
 rawset(_G, "ValleyJDUI", app)
-local state = { speed = false, target = 36,
-    threats = false, threatRange = 45 }
+local state = { speed = false, target = 36 }
 local controls, liveLabels, cooldownTuners = {}, {}, {}
 local connection, characterId, lastMovementReset
 local pendingVelocity
 local movementStatus = "Off"
-local threatStatus = "Off"
-local nextThreat, nextLabels, nextCooldown, nextLog, lastAlert = 0, 0, 0, 0, -10
+local nextLabels, nextLog = 0, 0
 local logLines = {}
 local logDirty, nextLogWrite = false, 0
 local function flushLog(force)
@@ -80,13 +78,7 @@ local function disable(feature, reason)
     notify("Control stopped", feature .. ": " .. reason)
 end
 local function restoreCooldown(tuner)
-    for key, saved in pairs(tuner.saved or {}) do
-        if attr(tuner.object, key) == saved.applied then
-            local success, err = pcall(function() tuner.object:SetAttribute(key, saved.natural) end)
-            if not success then log(tuner.name .. " restore: " .. tostring(err)) end
-        end
-    end
-    tuner.saved, tuner.object, tuner.natural, tuner.deadline, tuner.started, tuner.dashCount = {}, nil, nil, nil, nil, nil
+    tuner.object, tuner.started, tuner.dashCount = nil, nil, nil
     tuner.completed = false
     tuner.cache, tuner.candidates, tuner.observed, tuner.applied, tuner.corrected = nil, nil, nil, nil, nil
     tuner.pinned, tuner.writtenEntry, tuner.appliedAt = nil, nil, nil
@@ -118,8 +110,7 @@ ui.Title = "Huss Valley"
 ui:SetLayout("Compact")
 local movement = ui:AddTab({ Title = "Movement", Icon = "bolt" })
 local dashing = ui:AddTab({ Title = "Dash", Icon = "bolt", Columns = 1 })
-local cooldowns = ui:AddTab({ Title = "Cooldowns", Icon = "sliders" })
-ui.Tabs = { movement, dashing, cooldowns, ui.Settings }
+ui.Tabs = { movement, dashing, ui.Settings }
 for i = #ui.Settings.Controls, 1, -1 do
     if ui.Settings.Controls[i].Title == "Test notification" then table.remove(ui.Settings.Controls, i) end
 end
@@ -145,22 +136,12 @@ local function slider(tab, title, feature, lo, hi, step, suffix)
 end
 toggle(movement, "Speed tuning", "speed", "Uses movement input; preserves falling/jumping velocity")
 slider(movement, "Travel speed", "target", 10, 80, 1, " studs/s")
-toggle(cooldowns, "Catcher alerts", "threats", "Nearby active catchers; warnings only while you are a runner")
-slider(cooldowns, "Alert distance", "threatRange", 10, 150, 5, " studs")
-liveLabel(cooldowns, "Threat status", function() return threatStatus end)
-cooldowns:AddLabel({ Title = "Client cooldown caps", Description = "Dash changes its internal timer. Other controls change client request gates; server limits still apply." })
-local cooldownFields = {
-    { name = "Dash", character = true, dash = true },
-    { name = "Dagger", character = true, key = "DaggerReadyAt" },
-    { name = "Ability", key = "AbilityReadyAt" }, { name = "Gear", key = "GearReadyAt" },
-    { name = "Ghost", key = "GhostAbilityReadyAt" }, { name = "Clone", key = "CloneAbilityReadyAt" },
-    { name = "Tackle", key = "TackleReadyAt" },
-}
+local cooldownFields = { { name = "Dash", character = true, dash = true } }
 for _, field in ipairs(cooldownFields) do
     local tuner = { name = field.name, character = field.character, key = field.key, dash = field.dash,
-        enabled = false, seconds = 0, saved = {}, status = "Off" }
+        enabled = false, seconds = 0, status = "Off" }
     cooldownTuners[#cooldownTuners + 1] = tuner
-    local tab = field.dash and dashing or cooldowns
+    local tab = dashing
     local group = tab:AddIsland({ Title = field.name .. " cooldown" })
     tuner.control = group:AddToggle({ Title = "Tune " .. field.name, Default = false,
         Callback = function(on)
@@ -168,9 +149,8 @@ for _, field in ipairs(cooldownFields) do
             if not on then restoreCooldown(tuner); tuner.status = "Off" end
         end })
     group:AddSlider({ Title = field.name .. " max cooldown", Min = 0, Max = 15, Step = .1, Default = 0, Suffix = " s",
-        Description = field.dash and "0 = timer reset; enable release re-arm to end motion/recovery early"
-            or "0 = client request gate reset; server limits still apply",
-        Callback = function(seconds) tuner.seconds = seconds; tuner.deadline = nil end })
+        Description = "0 = timer reset; enable release re-arm to end motion/recovery early",
+        Callback = function(seconds) tuner.seconds = seconds end })
     if field.dash then
         group:AddToggle({ Title = "Re-arm dash on Space release", Default = false,
             Description = "Experimental: ends the current dash early; turn again before the next Space press",
@@ -181,30 +161,8 @@ for _, field in ipairs(cooldownFields) do
     end
     liveLabel(group, "Write status", function() return tuner.status end)
 end
-cooldowns:AddButton({ Title = "Stop cooldown tuning", ButtonText = "Stop all", Callback = function()
-    for _, tuner in ipairs(cooldownTuners) do
-        tuner.enabled = false; tuner.control:SetValue(false, true); restoreCooldown(tuner); tuner.status = "Off"
-    end
-end })
 ui:SetConfig("huss_valley_config")
 movement:Select()
-local function serverTime()
-    local success, now = pcall(function() return world:GetServerTimeNow() end)
-    return success and finite(now) and now or os.time()
-end
-local function cooldownWrite(tuner, key, value)
-    local current = attr(tuner.object, key)
-    if type(current) ~= type(value) then error(key .. " unavailable or wrong type") end
-    local saved = tuner.saved[key]
-    if current == value then return true end
-    if not saved then saved = { natural = current }; tuner.saved[key] = saved
-    elseif current ~= saved.applied then saved.natural = current end
-    tuner.object:SetAttribute(key, value)
-    saved.applied = value
-    local after = attr(tuner.object, key)
-    return after == value or (finite(after) and finite(value) and math.abs(after - value) < .001)
-end
-
 local function timerRead(entry, limit)
     local success, value = pcall(memory_read, "double", entry.addr)
     if success and finite(value) and value >= 0 and value < (limit or 60) then return value end
@@ -1024,36 +982,17 @@ local function dashCooldownStep(tuner, object, now)
 
     applyDashCap(tuner, candidate.entry, before, now)
 end
-local function cooldownStep(c, now, dashOnly)
+local function cooldownStep(c, now)
     for _, tuner in ipairs(cooldownTuners) do
-        if tuner.enabled and (not dashOnly or tuner.dash) then
+        if tuner.enabled then
             local object = me
             if tuner.character then object = c end
             if id(object) ~= id(tuner.object) then restoreCooldown(tuner); tuner.object = object end
             if not object then tuner.status = "Waiting for character"
             else
                 local success, err = pcall(function()
-                    if tuner.dash then
-                        if tuner.rearm and tuner.seconds == 0 then dashStateStep(tuner, object, now)
-                        else dashCooldownStep(tuner, object, now) end
-                    else
-                        local current = attr(object, tuner.key)
-                        if not finite(current) then tuner.status = "Attribute unavailable"; return end
-                        local saved = tuner.saved[tuner.key]
-                        local ownValue = saved and current == saved.applied
-                        if not ownValue and current ~= tuner.natural then
-                            tuner.natural = current; tuner.started = serverTime(); tuner.deadline = nil
-                        end
-                        if not finite(tuner.natural) or tuner.natural <= 0 then tuner.status = "Already ready"; return end
-                        if tuner.seconds > 0 and tuner.natural < 1e9 then
-                            tuner.status = "Unknown clock; use 0 for client reset"; return
-                        end
-                        tuner.deadline = tuner.deadline or (tuner.seconds == 0 and 0
-                            or math.min(tuner.natural, tuner.started + tuner.seconds))
-                        if tuner.deadline == tuner.natural then tuner.status = "Natural cooldown is shorter"; return end
-                        local observed = cooldownWrite(tuner, tuner.key, tuner.deadline)
-                        tuner.status = observed and "Readback applied; gameplay unverified" or "Write not observed; game may override"
-                    end
+                    if tuner.rearm and tuner.seconds == 0 then dashStateStep(tuner, object, now)
+                    else dashCooldownStep(tuner, object, now) end
                 end)
                 if not success then
                     tuner.enabled = false; tuner.control:SetValue(false, true)
@@ -1134,31 +1073,6 @@ local function movementStep(c, root, now)
     end
     if not pendingVelocity then pendingVelocity = { at = now, target = target } end
 end
-local function threatStep(root, now)
-    if not state.threats then threatStatus = "Off"; return end
-    if attr(me, "GameRole") ~= "Runner" or attr(me, "InMatch") ~= true then
-        threatStatus = "Waiting for runner role"; return
-    end
-    local position = read(root, "Position")
-    if not vector(position) then threatStatus = "Waiting for character"; return end
-    local success, list = pcall(function() return players:GetChildren() end)
-    if not success then threatStatus = "Players unavailable"; return end
-    local nearest, nearestName = math.huge, nil
-    for _, player in ipairs(list) do
-        if id(player) ~= id(me) and read(player, "ClassName") == "Player"
-            and attr(player, "GameRole") == "Catcher" and attr(player, "InMatch") == true then
-            local p = read(child(read(player, "Character"), "HumanoidRootPart"), "Position")
-            if vector(p) then
-                local distance = math.sqrt((p.X-position.X)^2 + (p.Y-position.Y)^2 + (p.Z-position.Z)^2)
-                if distance < nearest then nearest, nearestName = distance, read(player, "Name") end
-            end
-        end
-    end
-    threatStatus = nearestName and string.format("%s: %.0f studs", nearestName, nearest) or "No active catchers visible to client"
-    if nearestName and nearest <= state.threatRange and now - lastAlert >= 5 then
-        lastAlert = now; notify("Catcher nearby", threatStatus)
-    end
-end
 local function step()
     if not app.alive then return end
     if not ui.Alive then app.stop(); return end
@@ -1172,9 +1086,7 @@ local function step()
         lastMovementReset = attr(c, "MovementReset")
     end
     if root then movementStep(c, root, now) else movementStatus = "Waiting for character" end
-    if now >= nextThreat then nextThreat = now + .1; threatStep(root, now) end
-    if now >= nextCooldown then nextCooldown = now + .05; cooldownStep(c, now)
-    else cooldownStep(c, now, true) end
+    cooldownStep(c, now)
     if now >= nextLabels then
         nextLabels = now + .2
         for _, label in ipairs(liveLabels) do label.control:SetDescription(label.provider()) end
@@ -1188,4 +1100,4 @@ connection = run.RenderStepped:Connect(function()
     local success, err = pcall(step)
     if not success then log("Runtime error: " .. tostring(err)); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.16 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.17 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))

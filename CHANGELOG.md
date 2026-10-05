@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.17 - 2026-10-05
+
+- Remove Dagger, Ability, Gear, Ghost, Clone and Tackle cooldown controls and all associated attribute-writing code.
+- Remove catcher alerts, distance/status controls and recurring catcher enumeration. Remove the now-empty Cooldowns tab and its Stop all button.
+- Retain Movement, Dash and Settings with the same saved movement/dash values, theme and menu key. Old saved keys for removed features are ignored.
+- Movement, dash/reload/config regressions and 120 next-frame relocation checks pass. This feature removal does not establish a fix for the separately reported Matcha process crash.
+
 ## 0.6.16 - 2026-10-05
 
 - Retry temporary GC exceptions and invalid scan results without permanently disabling dash tuning or changing saved toggles. Both timer-only and release re-arm modes recover automatically; failed scans never write memory.
