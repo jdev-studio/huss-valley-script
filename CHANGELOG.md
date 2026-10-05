@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.18 - 2026-10-05
+
+- Wait for a ready Roblox player, mouse and camera before loading JDUI. Re-running while waiting replaces the pending startup callback instead of creating duplicate menus.
+- Retry an unsuccessful GitHub download once; reject empty/HTML responses before executing library code. JDUI still downloads exclusively from the tested GitHub revision.
+- Support missing `task.spawn` and font tables through local JDUI compatibility adapters. Text keeps its native default font when optional font constants are unavailable.
+- Validate downloaded avatar PNG signatures, chunk boundaries, dimensions and size before forwarding data to Matcha's native Drawing image decoder. Invalid responses use JDUI's existing initial badge; valid avatars remain supported.
+- Regression cases reproduce the previous delayed-player, missing scheduler/fonts, empty download and invalid-image forwarding failures. Those cases now pass, along with valid avatars, network exceptions, HTML download retries, dash tracking and saved settings.
+- This hardens known startup and native-input failure paths. Without an affected PC or crash report, the exact reported Matcha process crash remains unconfirmed.
+
 ## 0.6.17 - 2026-10-05
 
 - Remove Dagger, Ability, Gear, Ghost, Clone and Tackle cooldown controls and all associated attribute-writing code.

@@ -1,16 +1,57 @@
+local function bootstrap()
 local previous = rawget(_G, "ValleyJDUI")
-if previous and previous.stop then pcall(previous.stop) end
+if type(previous) == "table" and type(previous.stop) == "function" then pcall(previous.stop) end
 local players = game:GetService("Players")
 local world = game:GetService("Workspace")
 local run = game:GetService("RunService")
 local me = assert(players.LocalPlayer, "Local player unavailable")
 local ok, ui = pcall(function()
-    local source = game:HttpGet("https://raw.githubusercontent.com/jdev-studio/jdui/d406250dcb43319cb081dfc6d9d7baa79739f473/JDUI")
-    assert(type(source) == "string" and #source > 0, "GitHub JDUI download failed")
+    local source, failure
+    for attempt = 1, 2 do
+        local success, result = pcall(function()
+            return game:HttpGet("https://raw.githubusercontent.com/jdev-studio/jdui/d406250dcb43319cb081dfc6d9d7baa79739f473/JDUI")
+        end)
+        if success and type(result) == "string" and result:find("local env=getfenv()", 1, true)
+            and result:find("function app:AddTab", 1, true) then source = result; break end
+        failure = result
+    end
+    assert(source, "GitHub JDUI download failed: " .. tostring(failure))
 
     source = source:gsub('label%("brand","JDUI",70,25,27,', 'label("brand","Huss Valley",70,29,18,', 1)
     source = source:gsub('label%("playerName",short%(playerDisplayName,13%),70,26,14,', 'label("brand","Huss Valley",70,26,14,', 1)
-    return loadstring(source)()
+    source = source:gsub('local fontRegular,fontBold=Drawing.Fonts.System,Drawing.Fonts.SystemBold',
+        'local fonts=Drawing.Fonts or {};local fontRegular,fontBold=fonts.System or fonts.UI,fonts.SystemBold or fonts.System or fonts.UI', 1)
+    source = source:gsub('assert%(type%(bytes%)=="string" and #bytes>0,"Avatar image unavailable"%)',
+        'assert(hussPng(bytes),"Avatar image unavailable")', 1)
+    source = [[
+local nativeSpawn=type(task)=="table" and task.spawn
+local task={spawn=type(nativeSpawn)=="function" and nativeSpawn or function(fn,...) return fn(...) end}
+local function hussPng(bytes)
+    if type(bytes)~="string" or #bytes<57 or #bytes>1048576
+        or bytes:sub(1,8)~=string.char(137,80,78,71,13,10,26,10) then return false end
+    local function number(at)
+        local a,b,c,d=bytes:byte(at,at+3)
+        if not d then return end
+        return ((a*256+b)*256+c)*256+d
+    end
+    local width,height=number(17),number(21)
+    if number(9)~=13 or bytes:sub(13,16)~="IHDR" or not width or not height
+        or width<1 or height<1 or width>512 or height>512 then return false end
+    local cursor,hasData=9,false
+    for chunk=1,256 do
+        local length=number(cursor)
+        if not length or length>#bytes-cursor-11 then return false end
+        local name=bytes:sub(cursor+4,cursor+7)
+        if name=="IDAT" and length>0 then hasData=true end
+        if name=="IEND" then return length==0 and hasData and cursor+11==#bytes end
+        cursor=cursor+length+12
+    end
+    return false
+end
+]] .. source
+    local chunk, compileError = loadstring(source)
+    assert(type(chunk) == "function", "GitHub JDUI compile failed: " .. tostring(compileError))
+    return chunk()
         or rawget(_G, "JDUI") or getfenv().JDUI
 end)
 assert(ok and type(ui) == "table", "JDUI could not load: " .. tostring(ui))
@@ -1100,4 +1141,34 @@ connection = run.RenderStepped:Connect(function()
     local success, err = pcall(step)
     if not success then log("Runtime error: " .. tostring(err)); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.17 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.18 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+end
+local pending = rawget(_G, "ValleyJDUIStartup")
+if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
+local function ready()
+    local success, available = pcall(function()
+        local player = game:GetService("Players").LocalPlayer
+        local camera = game:GetService("Workspace").CurrentCamera
+        local viewport = camera and camera.ViewportSize
+        return player and player:GetMouse() and viewport and viewport.X > 0 and viewport.Y > 0
+    end)
+    return success and available == true
+end
+if ready() then bootstrap()
+else
+    local startup = { alive = true }
+    local watcher
+    function startup.stop()
+        startup.alive = false
+        if watcher then watcher:Disconnect(); watcher = nil end
+        if rawget(_G, "ValleyJDUIStartup") == startup then rawset(_G, "ValleyJDUIStartup", nil) end
+    end
+    rawset(_G, "ValleyJDUIStartup", startup)
+    watcher = game:GetService("RunService").RenderStepped:Connect(function()
+        if not startup.alive or not ready() then return end
+        startup.stop()
+        local success, failure = pcall(bootstrap)
+        if not success then print("[Valley JDUI] Startup failed: " .. tostring(failure)) end
+    end)
+    print("[Valley JDUI] Waiting for Roblox player and camera before loading")
+end

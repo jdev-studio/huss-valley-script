@@ -11,4 +11,4 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/jdev-studio/huss-vall
 - Enable **unsafe Lua execution** in Matcha for dash tuning.
 - Settings save automatically and restore when you reload.
 
-Version **0.6.17** - [Changelog](CHANGELOG.md)
+Version **0.6.18** - [Changelog](CHANGELOG.md)
