@@ -1086,7 +1086,10 @@ end
 local function movementStep(c, root, now)
     local reset = attr(c, "MovementReset")
     if finite(reset) and finite(lastMovementReset) and reset > lastMovementReset then
-        log("Game movement reset " .. tostring(reset) .. "; requested speed " .. tostring(state.target))
+        pendingVelocity = nil
+        if state.speed then
+            disable("speed", "Game corrected movement; reduce Travel speed before enabling again")
+        end
     end
     lastMovementReset = reset
     if not state.speed then movementStatus = "Off"; return end
@@ -1158,7 +1161,7 @@ connection = frame:Connect(function()
     local success, err = pcall(step)
     if not success then log("Runtime error: " .. tostring(err)); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.19 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.20 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end

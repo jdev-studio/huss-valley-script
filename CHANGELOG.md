@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.20 - 2026-10-05
+
+- Stop speed tuning before its next velocity write when the game's MovementReset counter increases. Previously the script only logged the correction and kept forcing the same speed, allowing repeated corrections.
+- Clear pending velocity confirmation and notify the user to lower Travel speed before enabling again. Preserve the speed slider, dash controls and saved settings.
+- Regression reproduces the previous post-correction writes and verifies that they stop, the slider remains unchanged and manual re-enabling still works. This cannot prevent the game's initial correction or establish the cause of an unobserved position jump.
+
 ## 0.6.19 - 2026-10-05
 
 - Fix the startup nil `RunService` / `RenderStepped` error. Retry scheduler discovery for up to 100 yielded attempts, accepting an available global service and Heartbeat when RenderStepped is absent.
