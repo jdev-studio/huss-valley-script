@@ -75,7 +75,7 @@ assert(ok and type(ui) == "table", "JDUI could not load: " .. tostring(ui))
 local app = { alive = true, ui = ui }
 rawset(_G, "ValleyJDUI", app)
 local state = { speed = false, target = 36 }
-local controls, liveLabels, cooldownTuners = {}, {}, {}
+local controls, liveLabels = {}, {}
 local connection, characterId
 local pendingVelocity
 local MAX_SPEED = 45
@@ -137,29 +137,10 @@ local function disable(feature, reason)
     log(feature .. ": " .. reason)
     notify("Control stopped", feature .. ": " .. reason)
 end
-local function restoreCooldown(tuner)
-    tuner.object, tuner.started, tuner.dashCount = nil, nil, nil
-    tuner.completed = false
-    tuner.cache, tuner.candidates, tuner.observed, tuner.applied, tuner.corrected = nil, nil, nil, nil, nil
-    tuner.pinned, tuner.writtenEntry, tuner.appliedAt = nil, nil, nil
-    tuner.refreshPending = nil
-    tuner.gates, tuner.nextGateScan, tuner.rearmedCount = nil, nil, nil
-    tuner.stateGroups, tuner.stateGroup, tuner.stateLost, tuner.nextStateScan = nil, nil, nil, nil
-    tuner.stateFaultAt, tuner.stateReadyAt = nil, nil
-    tuner.stateRefreshActive = nil
-    tuner.stateCandidates, tuner.stateObserved, tuner.stateProbeCount, tuner.stateValidatedCount = nil, nil, nil, nil
-    tuner.nodeLayouts, tuner.nodeAnchor, tuner.nodeSearch, tuner.nodeAttempted = nil, nil, nil, nil
-    tuner.portableScan, tuner.portableStatus = nil, nil
-    tuner.historySeeds, tuner.trackerSearch, tuner.tableTracker, tuner.tableFaultAt = nil, nil, nil, nil
-    tuner.trackingHeaders = nil
-    tuner.headerSelection, tuner.nextHeaderSelection, tuner.headerCount = nil, nil, nil
-    tuner.nextGcRetry, tuner.gcFault = nil, nil
-end
 function app.stop()
     if not app.alive then return end
     app.alive = false
     if connection then connection:Disconnect() end
-    for _, tuner in ipairs(cooldownTuners) do restoreCooldown(tuner) end
     if ui.Alive then ui:Destroy() end
     if rawget(_G, "ValleyJDUI") == app then rawset(_G, "ValleyJDUI", nil) end
     log("Stopped; movement writes ended; settings saved")
@@ -195,865 +176,233 @@ local function slider(tab, title, feature, lo, hi, step, suffix)
 end
 toggle(movement, "Speed tuning", "speed", "Uses movement input; preserves falling/jumping velocity")
 slider(movement, "Travel speed", "target", 10, MAX_SPEED, 1, " studs/s")
-local cooldownFields = { { name = "Dash", character = true, dash = true } }
-for _, field in ipairs(cooldownFields) do
-    local tuner = { name = field.name, character = field.character, key = field.key, dash = field.dash,
-        enabled = false, seconds = 0, status = "Off" }
-    cooldownTuners[#cooldownTuners + 1] = tuner
-    local tab = movement
-    app.dash, app.restoreDash = tuner, restoreCooldown -- lets tools/valley_test.js drive the timer engine directly
-    local group = tab:AddIsland({ Title = field.name .. " cooldown" })
-    -- One switch for the full no-cooldown path (timer reset + re-arm on Space release).
-    tuner.control = group:AddToggle({ Title = "Infinite dash (no cooldown)", Default = false,
-        Description = "Dash again as soon as you release Space",
-        Callback = function(on)
-            restoreCooldown(tuner)
-            tuner.enabled, tuner.seconds, tuner.rearm = on, 0, on
-            if not on then tuner.status = "Off" end
-        end })
-    liveLabel(group, "Write status", function() return tuner.status end)
-end
+local dash = { infinite = false, longer = false, scale = 1.5, status = "Off", boost = "Off" }
+app.dashState = dash -- lets tools/valley_test.js inspect the shared tracker
+local cooldownGroup = movement:AddIsland({ Title = "Dash cooldown" })
+cooldownGroup:AddToggle({ Title = "Infinite dash (no cooldown)", Default = false,
+    Description = "Dash again as soon as the dash ends",
+    Callback = function(on) dash.infinite = on end })
+liveLabel(cooldownGroup, "Write status", function() return dash.infinite and dash.status or "Off" end)
+local distanceGroup = movement:AddIsland({ Title = "Dash distance" })
+distanceGroup:AddToggle({ Title = "Longer dash", Default = false, Description = "Each dash travels further",
+    Callback = function(on) dash.longer = on end })
+distanceGroup:AddSlider({ Title = "Dash distance", Min = 1.1, Max = 3, Step = .1, Default = dash.scale, Suffix = "x",
+    Callback = function(v) dash.scale = v end })
+liveLabel(distanceGroup, "Distance status", function() return dash.longer and (dash.track and dash.boost or dash.status) or "Off" end)
 ui:SetConfig("huss_valley_config")
 movement:Select()
-local function timerRead(entry, limit)
-    local success, value = pcall(memory_read, "double", entry.addr)
-    if success and finite(value) and value >= 0 and value < (limit or 60) then return value end
-end
-local function scanDashGc(tuner, keys, now)
-    if now < (tuner.nextGcRetry or 0) then return end
-    local success, entries = pcall(getgc, keys)
-    if not success or type(entries) ~= "table" then
-        tuner.nextGcRetry = tick() + 1
-        tuner.status = "Memory scan unavailable; retrying"
-        if not tuner.gcFault then log("Dash scan waiting: " .. tostring(entries)) end
-        tuner.gcFault = true
-        return
-    end
-    if tuner.gcFault then log("Dash memory scan recovered") end
-    tuner.nextGcRetry, tuner.gcFault = nil, nil
-    local valid = {}
-    for _, entry in ipairs(entries) do
-        if type(entry) == "table" then valid[#valid + 1] = entry end
-    end
-    return valid
-end
-local function timerMatches(value, published)
-
-    return finite(value) and value <= published + .015 and published - value <= .16
-end
-local dashKeys = { "cooldown", "dashCount", "dashRemaining", "recoveryRemaining" }
+-- Both dash features share one view of the game's private movement table (MovementModel state).
+-- In Matcha a GetAttribute costs ~0.8ms but a memory_read ~0.002ms, so the per-frame path reads memory only.
+-- Luau node (32 bytes): value +0, value tag +12, key string +16, key tag (low 4 bits) and chain +28.
+local requiredKeys = { "dashCount", "cooldown", "dashRemaining", "recoveryRemaining" }
+local boostKeys = { "dashElapsed", "boostStart", "boostExit", "boostLift" }
+local wantedKeys = { travelHistory = true }
+for _, name in ipairs(requiredKeys) do wantedKeys[name] = true end
+for _, name in ipairs(boostKeys) do wantedKeys[name] = true end
+local keyNames = {} -- interned key string address -> name, learned on the first discovery
 local function memoryValue(kind, address)
     local success, value = pcall(memory_read, kind, address)
     if success then return value end
 end
-local function nodeKey(address, key, reference, valueTag)
-
-    local pointer = memoryValue("uintptr_t", address + 16)
-    if not validAddress(pointer) or pointer < 65536 or (reference and pointer ~= reference) then return end
+local function number(address)
+    if memoryValue("int", address + 12) ~= 3 then return end
+    local value = memoryValue("double", address)
+    if finite(value) then return value end
+end
+local function nodeName(address)
     local tag = memoryValue("int", address + 28)
-    if memoryValue("int", address + 12) ~= (valueTag or 3) or not finite(tag) or tag % 16 ~= 6 then return end
-    if memoryValue("int", pointer + 20) ~= #key or memoryValue("string", pointer + 24) ~= key then return end
-    return pointer
+    if not finite(tag) or tag % 16 ~= 6 then return end -- live string key only; free/dead nodes keep stale pointers
+    local pointer = memoryValue("uintptr_t", address + 16)
+    if not validAddress(pointer) or pointer < 65536 then return end
+    local known = keyNames[pointer]
+    if known then return known, pointer end
+    local length = memoryValue("int", pointer + 20)
+    if not finite(length) or length < 8 or length > 17 then return end
+    local name = memoryValue("string", pointer + 24)
+    if wantedKeys[name] and #name == length then return name, pointer end
 end
-local function learnDashNodes(tuner, group, count)
-    if type(memory_write) ~= "function" then return end
-    local base, layout = tonumber(group.cooldown.addr), { offsets = {}, references = {} }
-    for _, name in ipairs(dashKeys) do
-        local entry = group[name]
-        if not entry and name == "dashCount" then
-
-            for offset = -1024, 1024, 32 do
-                local address = base + offset
-                if nodeKey(address, name) and timerRead({ addr = address }, 1e12) == count then
-                    if entry then return end
-                    entry = { addr = address }
-                end
-            end
-        end
-        local address = entry and tonumber(entry.addr)
-        if not validAddress(address) or math.abs(address - base) > 2048 or (address - base) % 8 ~= 0 then return end
-        local pointer = nodeKey(address, name)
-        if not pointer then return end
-        layout.offsets[name], layout.references[name] = address - base, pointer
-    end
-    tuner.nodeLayouts = tuner.nodeLayouts or {}
-    local signature = table.concat({ layout.offsets.dashCount, layout.offsets.dashRemaining, layout.offsets.recoveryRemaining,
-        layout.references.cooldown, layout.references.dashCount, layout.references.dashRemaining, layout.references.recoveryRemaining }, ":")
-    layout.signature = signature
-    for i = #tuner.nodeLayouts, 1, -1 do
-        if tuner.nodeLayouts[i].signature == signature then table.remove(tuner.nodeLayouts, i) end
-    end
-    table.insert(tuner.nodeLayouts, 1, layout)
-    if #tuner.nodeLayouts > 2 then table.remove(tuner.nodeLayouts) end
-    if not tuner.nodeAnchor then log("Dash bounded lookup enabled; exact numeric field names verified") end
-    tuner.nodeAnchor = base
-end
-local function dashTimerWrite(entries, values)
-    if not entries[1].localNode then return applygc(entries, values) end
-    for _, entry in ipairs(entries) do
-        if not nodeKey(entry.addr, entry.key, entry.keyRef) then return nil end
-    end
-    for _, entry in ipairs(entries) do
-        if entry.tableAddress and memoryValue("uintptr_t", entry.tableAddress + entry.nodeOffset) ~= entry.nodeBase then return nil end
-        memory_write("double", entry.addr, values[entry.key])
-    end
-    return #entries
-end
-local function applyDashCap(tuner, entry, before, now)
-    local remaining = math.max(0, tuner.seconds - (now - tuner.started))
-    if before <= remaining then tuner.completed = true; tuner.status = "Natural timer is shorter"; return end
-    local changed = dashTimerWrite({ entry }, { cooldown = remaining })
-    if changed == nil and entry.localNode then tuner.status = "Dash node changed; retry next frame"; return end
-    local after = timerRead(entry)
-    assert(changed == 1 and finite(after) and math.abs(after - remaining) <= .03, "Internal timer write not observed")
-    tuner.completed, tuner.applied, tuner.candidates = true, remaining, nil
-    tuner.writtenEntry, tuner.appliedAt = entry, now
-    tuner.status = "Internal timer shortened; waiting for game readiness"
-    log(string.format("Dash %s timer @%s: %.3f -> %.3f; readback %.3f", tuner.dashCount, tostring(entry.addr), before, remaining, after))
-end
-local function dashRearmStep(tuner, object, now)
-    if not tuner.rearm or tuner.seconds ~= 0 or not tuner.pinned or not tuner.applied
-        or tuner.corrected or tuner.rearmedCount == tuner.dashCount then return end
-
-    local owner = tonumber(tuner.pinned.tbl)
-    if not validAddress(owner) then tuner.status = "Re-arm unavailable: GC table owner missing"; return end
-    if type(iskeypressed) ~= "function" or type(isrbxactive) ~= "function" then
-        tuner.status = "Re-arm unavailable: keyboard/focus API missing"; return
-    end
-    local focusOK, focused = pcall(isrbxactive)
-    local keyOK, held = pcall(iskeypressed, 0x20)
-    if not focusOK or focused ~= true or not keyOK or type(held) ~= "boolean" then return end
-    if held then tuner.status = "Timer reset; release Space to re-arm"; return end
-    if attr(object, "MovementLocked") == true or attr(object, "TackleActive") == true
-        or attr(object, "GearMotion") then return end
-    local humanoid = child(object, "Humanoid")
-    local root = child(object, "HumanoidRootPart")
-    local health = read(humanoid, "Health")
-    if not finite(health) or health <= 0 or read(humanoid, "Sit") == true
-        or read(humanoid, "PlatformStand") == true or not root or read(root, "Anchored") == true then return end
-    if not tuner.gates then tuner.status = "Re-arm: wait for a complete state scan"; return end
-    local gates = tuner.gates
-    if tonumber(gates.cooldown.tbl) ~= owner or tonumber(gates.cooldown.addr) ~= tonumber(tuner.pinned.addr) then
-        tuner.gates = nil; return
-    end
-    local count = tuner.stateValidatedCount
-    if gates.dashCount then count = timerRead(gates.dashCount, 1e12) end
-    local motion, recovery = timerRead(gates.dashRemaining), timerRead(gates.recoveryRemaining)
-    local cooldown = timerRead(gates.cooldown)
-    if count ~= attr(object, "DashCount") or count ~= tuner.dashCount or not motion or not recovery
-        or not cooldown or cooldown > .03 then
-        tuner.status = "Re-arm state changed; retry next frame"; return
-    end
-    if motion == 0 and recovery == 0 then tuner.rearmedCount = count; return end
-
-    focusOK, focused = pcall(isrbxactive)
-    keyOK, held = pcall(iskeypressed, 0x20)
-    if not focusOK or focused ~= true or not keyOK or held ~= false
-        or id(read(me, "Character")) ~= id(object) or attr(object, "MovementLocked") == true
-        or (gates.dashCount and timerRead(gates.dashCount, 1e12) ~= count)
-        or attr(object, "DashCount") ~= count then return end
-    local changed = dashTimerWrite({ gates.cooldown, gates.dashRemaining, gates.recoveryRemaining },
-        { cooldown = 0, dashRemaining = 0, recoveryRemaining = 0 })
-    if changed == nil and gates.cooldown.localNode then tuner.status = "Dash node changed; retry next frame"; return end
-    assert(changed == 3 and timerRead(gates.cooldown) == 0 and timerRead(gates.dashRemaining) == 0
-        and timerRead(gates.recoveryRemaining) == 0, "Dash re-arm write not observed")
-    tuner.rearmedCount = count
-    tuner.status = "Private dash gates cleared; turn + Space for another dash"
-    log(string.format("Dash %s release re-arm: motion %.3f / recovery %.3f -> 0", count, motion, recovery))
-end
-local function selectDashState(groups, count, published)
-    local selected, matches = nil, 0
-    for _, group in ipairs(groups or {}) do
-        if group.dashCount and timerRead(group.dashCount, 1e12) == count and timerMatches(timerRead(group.cooldown), published)
-            and timerRead(group.dashRemaining) and timerRead(group.recoveryRemaining) then
-            selected, matches = group, matches + 1
-        end
-    end
-    return matches == 1 and selected or nil, matches
-end
-local function hashDashField(base, size, reference, name, valueTag)
-    local hash = memoryValue("int", reference + 16)
-    if not finite(hash) or hash % 1 ~= 0 then return end
-    local index, visited = hash % size, {}
-    for _ = 1, 8 do
-        if index < 0 or index >= size or visited[index] then return end
-        visited[index] = true
+local function scanNodes(base, size)
+    local nodes = {}
+    for index = 0, size - 1 do
         local address = base + index * 32
-        local pointer = memoryValue("uintptr_t", address + 16)
-        local tag = memoryValue("int", address + 28)
-        if not finite(tag) or tag % 1 ~= 0 or tag % 16 == 0 then return end
-        if pointer == reference then
-            if nodeKey(address, name, reference, valueTag) then return address end
-            return
+        local name, pointer = nodeName(address)
+        if name then
+            if nodes[name] then return end -- one key twice: not a live node array
+            nodes[name], nodes[name .. "Key"] = address, pointer
         end
-        local nextIndex = math.floor(tag / 16)
-        if nextIndex == 0 then return end
-        index = index + nextIndex
     end
+    for _, name in ipairs(requiredKeys) do
+        if not nodes[name] or not number(nodes[name]) then return end
+    end
+    for _, name in ipairs(boostKeys) do
+        if not nodes[name] or not number(nodes[name]) then nodes.noBoost = true end
+    end
+    return nodes
 end
-local function preparePortableDash(tuner, entries)
-    if type(memory_write) ~= "function" then
-        tuner.portableStatus = "GC grouping unavailable; enable memory writes in Matcha"; return
+-- The table header keeps its address for the character's whole life; only its node array moves on rehash.
+local function headerNodes(header)
+    local at = header.address
+    if memoryValue("byte", at + header.typeOffset) ~= header.tag then return end
+    local power = memoryValue("byte", at + header.powerOffset)
+    if not finite(power) or power < 2 or power > 10
+        or memoryValue("byte", at + header.powerOffset + 1) ~= (2 ^ power - 1) % 256 then return end
+    local base = memoryValue("uintptr_t", at + header.nodeOffset)
+    if validAddress(base) and base >= 65536 then return base, 2 ^ power end
+end
+local function discoverDash(c, count)
+    local success, entries = pcall(getgc, { "travelHistory" })
+    if not success or type(entries) ~= "table" then return nil, "Memory scan unavailable" end
+    -- Layout measured live 2026-10-06; the full sweep only runs if Roblox reshuffles the table struct.
+    local layouts = { dash.layout or { typeOffset = 1, powerOffset = 4, nodeOffset = 24 } }
+    local reach = dash.layout and (dash.failures or 0) > 0 and 16384 or 1024 -- wide search only with one known layout
+    if dash.layout == nil and dash.swept then
+        for typeOffset = 0, 2 do for powerOffset = 3, 6 do for nodeOffset = 16, 40, 8 do
+            layouts[#layouts + 1] = { typeOffset = typeOffset, powerOffset = powerOffset, nodeOffset = nodeOffset }
+        end end end
     end
-    local references, seeds, seen = {}, {}, {}
-    local keys = { cooldown = true, dashCount = true, dashRemaining = true, recoveryRemaining = true }
+    local found, seen, owned = {}, {}, {}
     for _, entry in ipairs(entries) do
-        local address = tonumber(entry.addr)
-        if keys[entry.key] and entry.type == "number" and validAddress(address) then
-            local reference = nodeKey(address, entry.key)
-            if reference then
-                if references[entry.key] and references[entry.key] ~= reference then
-                    tuner.portableStatus = "Multiple Lua key namespaces; no unverified write"; return
-                end
-                references[entry.key] = reference
-                if entry.key == "cooldown" and not seen[address] then
-                    seeds[#seeds + 1] = address; seen[address] = true
-                end
-            end
-        end
-    end
-    for _, name in ipairs(dashKeys) do
-        if not references[name] then
-            tuner.portableStatus = "Cannot verify " .. name .. " nodes; check Matcha memory access/version"; return
-        end
-    end
-    tuner.portableStatus = nil
-    tuner.portableScan = { references = references, seeds = seeds, seed = 1, power = 5, index = 0,
-        groups = {}, seen = {}, began = tick() }
-end
-local function portableDashState(tuner, count, published)
-    local scan = tuner.portableScan
-    if not scan then return nil, false end
-    local began = tick()
-    for attempt = 1, 128 do
-        if scan.seed > #scan.seeds or (attempt > 1 and tick() - began >= .003) then break end
-        local size = 2 ^ scan.power
-        local seed = scan.seeds[scan.seed]
-        local base = seed - scan.index * 32
-        scan.index = scan.index + 1
-        if scan.index >= size then
-            scan.index = 0; scan.power = scan.power + 1
-            if scan.power > 7 then scan.power = 5; scan.seed = scan.seed + 1 end
-        end
-        if hashDashField(base, size, scan.references.cooldown, "cooldown") == seed then
-            local group, addresses = { localNodes = true, portable = true }, {}
-            for _, name in ipairs(dashKeys) do
-                local address = hashDashField(base, size, scan.references[name], name)
-                if not address then group = nil; break end
-                group[name] = { key = name, type = "number", vtt = 3, addr = address,
-                    tbl = base, localNode = true, keyRef = scan.references[name] }
-                addresses[#addresses + 1] = tostring(address)
-            end
-            if group then
-                local signature = table.concat(addresses, ":")
-                if not scan.seen[signature] then
-                    scan.seen[signature] = true; scan.groups[#scan.groups + 1] = group
-                end
-            end
-        end
-    end
-    if scan.seed <= #scan.seeds then tuner.status = "Identifying dash tables without GC owner metadata"; return nil, true end
-    for _, group in ipairs(scan.groups) do
-        local existing
-        for i, cached in ipairs(tuner.stateGroups) do
-            local same = true
-            for _, name in ipairs(dashKeys) do
-                if tonumber(cached[name] and cached[name].addr) ~= group[name].addr then same = false; break end
-            end
-            if same then existing = i; break end
-        end
-        if existing then tuner.stateGroups[existing] = group
-        else tuner.stateGroups[#tuner.stateGroups + 1] = group end
-    end
-    tuner.portableScan = nil
-    local selected, matches = selectDashState(scan.groups, count, published)
-    tuner.portableStatus = #scan.groups == 0 and "No verified dash table; check Matcha memory access/version" or nil
-    log(string.format("Portable dash lookup: %d verified tables, %d live matches in %.3fs", #scan.groups, matches, tick() - scan.began))
-    return selected, false
-end
-local function trackedNodeGroup(base, size, tracker, deadline)
-    local scan = tracker.nodeScan
-    if not scan or scan.base ~= base or scan.size ~= size then
-        scan = { base = base, size = size, index = 0, group = { localNodes = true, tracked = true } }
-        tracker.nodeScan = scan
-    end
-    local group, began = scan.group, tick()
-    for index = scan.index, size - 1 do
-        if deadline and index > scan.index and tick() >= deadline then
-            scan.seconds = (scan.seconds or 0) + tick() - began
-            scan.index = index; return nil, true
-        end
-        local address = base + index * 32
-        local reference = memoryValue("uintptr_t", address + 16)
-        if reference == tracker.historyRef then
-            if scan.history or not nodeKey(address, "travelHistory", reference, tracker.historyTag)
-                or memoryValue("uintptr_t", address) ~= tracker.history then tracker.nodeScan = nil; return end
-            scan.history = address
-        else
-            for _, name in ipairs(dashKeys) do
-                if reference == tracker.references[name] then
-                    if group[name] or not nodeKey(address, name, reference) then tracker.nodeScan = nil; return end
-                    group[name] = { key = name, type = "number", addr = address, tbl = tracker.address,
-                        localNode = true, keyRef = reference, tableAddress = tracker.address,
-                        nodeOffset = tracker.nodeOffset, nodeBase = base }
-                end
-            end
-        end
-    end
-    tracker.nodeScan = nil
-    if not scan.history then return end
-    for _, name in ipairs(dashKeys) do if not group[name] then return end end
-    group.lookupSeconds = (scan.seconds or 0) + tick() - began
-    return group
-end
-local function prepareDashTracking(tuner, group)
-    if tuner.tableTracker or not tuner.historySeeds or #tuner.historySeeds == 0 or type(memory_write) ~= "function" then return end
-    local references, expected = {}, {}
-    for _, name in ipairs(dashKeys) do
-        local address = group and group[name] and tonumber(group[name].addr)
-        if group and not validAddress(address) then return end
-        references[name] = group and nodeKey(address, name) or (tuner.portableScan and tuner.portableScan.references[name])
-        if not references[name] then return end
-        if group then expected[name] = address end
-    end
-    tuner.trackerSearch = { seeds = tuner.historySeeds, seed = 1, cursor = 0,
-        references = references, expected = group and expected, matches = {}, seen = {}, matched = {} }
-end
-local function dashTrackingSearchStep(tuner, count, published)
-    local search = tuner.trackerSearch
-    if not search then return end
-    local began = tick()
-    for attempt = 1, 128 do
-        if (search.seed > #search.seeds and not search.pending) or (attempt > 1 and tick() - began >= .002) then break end
-        if search.pending then
-            local candidate = search.pending[#search.pending]
-            local tracker = candidate.tracker
-            local group, pending = trackedNodeGroup(candidate.base, candidate.size, tracker, began + .002)
-            if pending then return end
-            table.remove(search.pending)
-            if #search.pending == 0 then search.pending = nil end
-            if group and search.expected then
-                for _, name in ipairs(dashKeys) do
-                    if group[name].addr ~= search.expected[name] then group = nil; break end
-                end
-            end
-            if group and not search.matched[tracker.address] then
-                search.matched[tracker.address] = true; search.matches[#search.matches + 1] = tracker
-            end
-        else
-        local seed, cursor = search.seeds[search.seed], search.cursor
-        local offset = math.ceil(cursor / 2) * 8 * (cursor % 2 == 0 and -1 or 1)
-        local address = seed.history + offset
-        search.cursor = cursor + 1
-        if search.cursor > 1024 then search.cursor = 0; search.seed = search.seed + 1 end
-        search.seen[seed.history] = search.seen[seed.history] or {}
-        if not search.seen[seed.history][address] then
-            search.seen[seed.history][address] = true
-            for typeOffset = 0, 2 do
-                if memoryValue("byte", address + typeOffset) == seed.historyTag then
-                    for powerOffset = 3, 6 do
-                        local power = memoryValue("byte", address + powerOffset)
-                        if finite(power) and power >= 5 and power <= 8 and power % 1 == 0
-                            and memoryValue("byte", address + powerOffset + 1) == (2 ^ power - 1) % 256 then
-                            for nodeOffset = 16, 40, 8 do
-                                local base = memoryValue("uintptr_t", address + nodeOffset)
-                                if validAddress(base) and base >= 65536 then
-                                    local tracker = { address = address, typeOffset = typeOffset, powerOffset = powerOffset,
-                                        nodeOffset = nodeOffset, history = seed.history, historyRef = seed.historyRef,
-                                        historyTag = seed.historyTag, references = search.references }
-                                    search.pending = search.pending or {}
-                                    search.pending[#search.pending + 1] = { tracker = tracker, base = base, size = 2 ^ power }
-                                end
-                            end
-                        end
+        local address = type(entry) == "table" and tonumber(entry.addr)
+        local tag = validAddress(address) and memoryValue("int", address + 12)
+        local history = tag and nodeName(address) == "travelHistory" and memoryValue("uintptr_t", address)
+        if validAddress(history) and history >= 65536 and not seen[history] then
+            seen[history] = true
+            -- MovementModel.new() builds the table and its travelHistory together, so the header is allocated nearby.
+            for offset = -reach, reach, 8 do
+                local at = history + offset
+                for _, layout in ipairs(layouts) do
+                    local header = { address = at, tag = tag, typeOffset = layout.typeOffset,
+                        powerOffset = layout.powerOffset, nodeOffset = layout.nodeOffset }
+                    local base, size = headerNodes(header)
+                    local nodes = base and not owned[base] and scanNodes(base, size)
+                    local live = nodes and number(nodes.dashCount)
+                    if live and live >= count and memoryValue("uintptr_t", nodes.travelHistory or 0) == history then
+                        owned[base] = true
+                        found[#found + 1] = { header = header, base = base, size = size, nodes = nodes, count = live }
                     end
                 end
             end
         end
-        end
     end
-    if search.seed <= #search.seeds or search.pending then return end
-    tuner.trackerSearch = nil
-    tuner.trackingHeaders = search.matches
-    tuner.headerSelection, tuner.nextHeaderSelection, tuner.headerCount = nil, nil, nil
-    log("Dash table tracking: " .. #search.matches .. " verified headers")
+    -- The scan blocks for 1-2s and the player may dash meanwhile, so compare against a fresh count.
+    local fresh = attr(c, "DashCount")
+    for i = #found, 1, -1 do
+        if found[i].count ~= fresh then table.remove(found, i) end
+    end
+    if #found ~= 1 then
+        if not dash.layout then dash.swept = true end -- next attempt tries every struct layout
+        return nil, #found == 0 and "Dash state not found" or "Dash state ambiguous", fresh
+    end
+    local track = found[1]
+    for _, name in ipairs(requiredKeys) do keyNames[track.nodes[name .. "Key"]] = name end
+    for _, name in ipairs(boostKeys) do
+        if track.nodes[name .. "Key"] then keyNames[track.nodes[name .. "Key"]] = name end
+    end
+    keyNames[track.nodes.travelHistoryKey] = "travelHistory"
+    dash.layout = { typeOffset = track.header.typeOffset, powerOffset = track.header.powerOffset, nodeOffset = track.header.nodeOffset }
+    return track, nil, fresh
 end
-local function selectTrackedHeader(tuner, count, published, deadline)
-    if not tuner.trackingHeaders then return end
-    if tuner.headerCount ~= count then tuner.nextHeaderSelection = nil end
-    tuner.headerCount = count
-    if tick() < (tuner.nextHeaderSelection or 0) then return end
-    local probe = tuner.headerSelection or { index = 1, groups = {}, trackers = {} }
-    tuner.headerSelection = probe
-    for index = probe.index, #tuner.trackingHeaders do
-        if index > probe.index and tick() >= deadline then probe.index = index; return nil, true end
-        local tracker = tuner.trackingHeaders[index]
-        local power = memoryValue("byte", tracker.address + tracker.powerOffset)
-        local base = memoryValue("uintptr_t", tracker.address + tracker.nodeOffset)
-        if finite(power) and power >= 5 and power <= 8 and power % 1 == 0 and validAddress(base)
-            and memoryValue("byte", tracker.address + tracker.typeOffset) == tracker.historyTag
-            and memoryValue("byte", tracker.address + tracker.powerOffset + 1) == (2 ^ power - 1) % 256 then
-            local group, pending = trackedNodeGroup(base, 2 ^ power, tracker, deadline)
-            if pending then probe.index = index; return nil, true end
-            if group then
-                probe.groups[#probe.groups + 1] = group
-                probe.trackers[group] = { tracker = tracker, base = base, power = power }
-            end
-        end
+local function writeNumber(track, name, value)
+    local address = track.nodes[name]
+    if memoryValue("uintptr_t", address + 16) ~= track.nodes[name .. "Key"] or not number(address) then
+        track.base = nil; return false -- node moved under us; the next frame re-reads the header
     end
-    tuner.headerSelection, tuner.nextHeaderSelection = nil, tick() + .25
-    local group = selectDashState(probe.groups, count, published)
-    local match = group and probe.trackers[group]
-    if not match then return end
-    local selected = match.tracker
-    if memoryValue("uintptr_t", selected.address + selected.nodeOffset) ~= match.base
-        or memoryValue("byte", selected.address + selected.powerOffset) ~= match.power then return end
-    selected.selectionGroup, selected.selectionBase, selected.selectionPower = group, match.base, match.power
-    tuner.tableTracker, tuner.trackingHeaders = selected, nil
-    log("Dash table tracking enabled @" .. selected.address .. "; verified header and history link")
+    local written = pcall(memory_write, "double", address, value)
+    local after = memoryValue("double", address)
+    return written and finite(after) and math.abs(after - value) <= 1e-6
 end
-local function trackedDashState(tuner, count, published, now)
-    local began = tick()
-    local deadline = began + .006
-    if not tuner.tableTracker then
-        local _, pending = selectTrackedHeader(tuner, count, published, deadline)
-        if pending then return nil, false end
+local function extendDash(track, count)
+    local nodes = track.nodes
+    if nodes.noBoost then dash.boost = "This dash type can't be extended"; return end
+    local elapsed, remaining = number(nodes.dashElapsed), number(nodes.dashRemaining)
+    local start, exit, lift = number(nodes.boostStart), number(nodes.boostExit), number(nodes.boostLift)
+    if not (elapsed and remaining and start and exit and lift) then
+        track.base = nil; dash.boost = "Dash state moved; next dash will extend"; return
     end
-    local tracker = tuner.tableTracker
-    if not tracker then return nil, false end
-    local power = memoryValue("byte", tracker.address + tracker.powerOffset)
-    local base = memoryValue("uintptr_t", tracker.address + tracker.nodeOffset)
-    if memoryValue("byte", tracker.address + tracker.typeOffset) ~= tracker.historyTag
-        or not finite(power) or power < 5 or power > 8 or power % 1 ~= 0
-        or memoryValue("byte", tracker.address + tracker.powerOffset + 1) ~= (2 ^ power - 1) % 256
-        or not validAddress(base) or base < 65536 then
-        tuner.tableTracker, tuner.tableFaultAt = nil, nil; return nil, false
+    if remaining <= 0 then
+        dash.boost = "Dash ended before it could be extended"; return
     end
-    if tracker.base == base and tracker.power == power and tuner.stateGroup and not tuner.stateFaultAt then return nil, false end
-    local group, pending
-    if tracker.selectionBase == base and tracker.selectionPower == power then group = tracker.selectionGroup end
-    tracker.selectionGroup, tracker.selectionBase, tracker.selectionPower = nil, nil, nil
-    if not group then group, pending = trackedNodeGroup(base, 2 ^ power, tracker, deadline) end
-    if pending then tuner.status = "Refreshing verified dash table"; return nil, true end
-    if group and selectDashState({ group }, count, published)
-        and memoryValue("uintptr_t", tracker.address + tracker.nodeOffset) == base
-        and memoryValue("byte", tracker.address + tracker.powerOffset) == power then
-        tracker.base, tracker.power, tuner.tableFaultAt = base, power, nil
-        group.lookupSeconds = math.max(group.lookupSeconds or 0, tick() - began)
-        return group, false
+    -- RunBoost distance = duration * ((boostStart + boostExit) / 2 + boostLift); boostLift's share of the
+    -- curve still ahead is 1 - (3u^2 - 2u^3), so this scales the whole dash exactly even a few frames late.
+    local duration = elapsed + remaining
+    local done = elapsed / duration
+    if done > .5 then dash.boost = "Dash seen too late; next one will extend"; return end
+    local pace = (start + exit) / 2 + lift
+    if not writeNumber(track, "boostLift", lift + (dash.scale - 1) * pace / (1 - 3 * done * done + 2 * done * done * done)) then
+        dash.boost = "Write not observed; retrying next dash"; return
     end
-    tuner.tableFaultAt = tuner.tableFaultAt or now
-    if now - tuner.tableFaultAt < .25 then
-        tuner.status = "Waiting for tracked dash publication"; return nil, true
-    end
-    tuner.tableTracker, tuner.tableFaultAt = nil, nil
-    return nil, false
+    dash.boost = string.format("Dash %s: %.1f -> %.1f studs", tostring(count), duration * pace, duration * pace * dash.scale)
 end
-local function nearbyDashState(tuner, count, published)
-    if not tuner.nodeLayouts or not tuner.nodeAnchor or tuner.nodeAttempted then return nil, false end
-    local search = tuner.nodeSearch
-    if not search then
-        search = { anchor = tuner.nodeAnchor, cursor = -16384, groups = {}, seen = {}, began = tick() }
-        tuner.nodeSearch = search
-    end
-    local frameStart = tick()
-    for i = 1, 256 do
-        if search.cursor > 16384 or (i > 1 and tick() - frameStart >= .003) then break end
-        local base = search.anchor + search.cursor
-        search.cursor = search.cursor + 8
-        local pointer = memoryValue("uintptr_t", base + 16)
-        for _, layout in ipairs(tuner.nodeLayouts) do
-            if pointer == layout.references.cooldown and not search.seen[base .. ":" .. layout.signature] then
-                local group = { localNodes = true }
-                for _, name in ipairs(dashKeys) do
-                    local address = base + layout.offsets[name]
-                    if not nodeKey(address, name, layout.references[name]) then group = nil; break end
-
-                    group[name] = { key = name, type = "number", vtt = 3, addr = address,
-                        tbl = base, localNode = true, keyRef = layout.references[name] }
-                end
-                search.seen[base .. ":" .. layout.signature] = true
-                if group then search.groups[#search.groups + 1] = group end
-            end
-        end
-    end
-    if search.cursor <= 16384 then tuner.status = "Checking nearby dash nodes"; return nil, true end
-    local selected, matches = selectDashState(search.groups, count, published)
-    search.finishedAt = search.finishedAt or tick()
-    if matches == 0 and #search.groups > 0 and tick() - search.finishedAt < .12 then
-        tuner.status = "Waiting for nearby dash publication"; return nil, true
-    end
-    tuner.nodeSearch, tuner.nodeAttempted = nil, true
-    log(string.format("Dash bounded lookup: %d live matches in %.3fs", matches, tick() - search.began))
-    if selected then
-        table.insert(tuner.stateGroups, 1, selected)
-        if #tuner.stateGroups > 32 then table.remove(tuner.stateGroups) end
-    end
-    return selected, false
+local function loseDash(reason)
+    dash.track, dash.status = nil, reason .. "; dash to find it again"
+    log("Dash state: " .. reason)
 end
-local function bindDashState(tuner, group, count)
-
-    tuner.completed, tuner.applied, tuner.corrected, tuner.writtenEntry, tuner.appliedAt = false, nil, nil, nil, nil
-    tuner.rearmedCount = nil
-    tuner.stateGroup, tuner.gates, tuner.pinned = group, group, group.cooldown
-    tuner.stateLost, tuner.stateFaultAt, tuner.stateRefreshActive = nil, nil, nil
-    tuner.stateValidatedCount = count
-    tuner.nodeSearch, tuner.nodeAttempted = nil, nil
-    learnDashNodes(tuner, group, count)
-    if group.tracked then
-        for i = #tuner.stateGroups, 1, -1 do
-            if tonumber(tuner.stateGroups[i].cooldown.addr) == group.cooldown.addr then table.remove(tuner.stateGroups, i) end
-        end
-        table.insert(tuner.stateGroups, 1, group)
-        if #tuner.stateGroups > 32 then table.remove(tuner.stateGroups) end
-    else prepareDashTracking(tuner, group) end
-    if group.tracked then
-        log(string.format("Followed dash table @%s; count %s; lookup %.3fms", tostring(tuner.pinned.tbl), count, (group.lookupSeconds or 0) * 1000))
-    else
-        log((group.portable and "Confirmed portable dash nodes @" or group.localNodes and "Confirmed nearby dash nodes @" or group.correlated and "Confirmed dash timers by natural descent @" or "Confirmed complete dash state @")
-            .. tostring(tuner.pinned.tbl) .. "; count " .. count)
+local function dashStep(c, now)
+    dash.motion = nil
+    if not dash.infinite and not dash.longer then dash.status = "Off"; return end
+    if type(getgc) ~= "function" or type(memory_read) ~= "function" or type(memory_write) ~= "function" then
+        dash.status = "Enable unsafe Lua execution in Matcha"; return
     end
-end
-local function observeSplitDashState(tuner, count, published)
-
-    local available = false
-    for _, group in ipairs(tuner.stateGroups or {}) do if not group.dashCount then available = true end end
-    if not available then return nil, false end
-    if published <= 0 then tuner.status = "Dash once to identify the timer group"; return nil, true end
-    if tuner.stateProbeCount ~= count then
-        tuner.stateProbeCount, tuner.stateObserved, tuner.stateCandidates = count, published, {}
-        for _, group in ipairs(tuner.stateGroups) do
-            local cooldown, motion = timerRead(group.cooldown), timerRead(group.dashRemaining)
-            if not group.dashCount and timerMatches(cooldown, published) and cooldown > 0
-                and motion and motion > 0 and timerRead(group.recoveryRemaining) then
-                tuner.stateCandidates[#tuner.stateCandidates + 1] = { group = group, last = cooldown, motion = motion, samples = 1 }
-            end
-        end
-    elseif published ~= tuner.stateObserved then
-        tuner.stateObserved = published
-        local survivors = {}
-        for _, candidate in ipairs(tuner.stateCandidates or {}) do
-            local cooldown, motion = timerRead(candidate.group.cooldown), timerRead(candidate.group.dashRemaining)
-            if timerMatches(cooldown, published) and candidate.last - cooldown > .015
-                and motion and motion <= candidate.motion and timerRead(candidate.group.recoveryRemaining) then
-                candidate.last, candidate.motion, candidate.samples = cooldown, motion, candidate.samples + 1
-                survivors[#survivors + 1] = candidate
-            end
-        end
-        tuner.stateCandidates = survivors
+    local character = id(c)
+    if character ~= dash.character then
+        dash.character, dash.track, dash.failedCount, dash.nextScan, dash.failures = character, nil, nil, now + .5, 0
     end
-    local candidates = tuner.stateCandidates or {}
-    if #candidates == 1 and candidates[1].samples >= 3 then
-        local group = candidates[1].group
-        group.correlated = true
-        return group, true
-    end
-    tuner.status = #candidates > 1 and "Timer groups ambiguous; no write" or "Identifying dash timer group"
-    return nil, #candidates > 0
-end
-local function dashStateStep(tuner, object, now)
-    if type(getgc) ~= "function" or type(applygc) ~= "function" or type(memory_read) ~= "function" then
-        tuner.status = "Internal state APIs unavailable"; return
-    end
-    local count, published, ready = attr(object, "DashCount"), attr(object, "DashCooldown"), attr(object, "DashReady")
-    if not finite(count) or count < 0 or count % 1 ~= 0 or not finite(published) or type(ready) ~= "boolean" then
-        tuner.status = "Dash state unavailable"; return
-    end
-    local mode = attr(object, "MovementState")
-    local idle = ready and published <= 0 and mode ~= "Boosting" and mode ~= "Dashing" and mode ~= "Recovering"
-    if idle then tuner.stateReadyAt = tuner.stateReadyAt or now else tuner.stateReadyAt = nil end
-    dashTrackingSearchStep(tuner, count, published)
-    local tracked, trackingPending = trackedDashState(tuner, count, published, now)
-    if tracked then bindDashState(tuner, tracked, count)
-    elseif trackingPending then return end
-    if not tuner.stateGroup and tuner.portableScan then
-        local portable, pending = portableDashState(tuner, count, published)
-        if portable then bindDashState(tuner, portable, count)
-        elseif pending then return end
-    end
-    if not tuner.stateGroup and tuner.trackerSearch then tuner.status = "Identifying stable dash table"; return end
-
-    if tuner.stateLost and tuner.stateGroups then
-        local cached = selectDashState(tuner.stateGroups, count, published)
-        if cached then bindDashState(tuner, cached, count) end
-        if not cached and published > 0 then
-            local waiting
-            cached, waiting = observeSplitDashState(tuner, count, published)
-            if cached then bindDashState(tuner, cached, count)
-            elseif waiting and now - (tuner.stateFaultAt or now) < .7 then
-
-                return
-            end
-        end
-        if tuner.stateLost then
-            local nearby, pending = nearbyDashState(tuner, count, published)
-            if nearby then bindDashState(tuner, nearby, count)
-            elseif pending then return end
-        end
-    end
-    if not tuner.stateGroups or (tuner.stateLost and (tuner.stateRefreshActive or (idle and now - tuner.stateReadyAt >= .15))
-        and now >= (tuner.nextStateScan or 0)) then
-        if not idle and not tuner.stateRefreshActive then tuner.status = "Wait for a natural ready state to scan"; return end
-
+    if not c then dash.status = "Waiting for character"; return end
+    local track = dash.track
+    if not track then
+        if now < (dash.nextScan or 0) then return end
+        dash.nextScan = now + .5
+        local count = attr(c, "DashCount")
+        if not finite(count) or count <= 0 then dash.status = "Dash once to find the dash state"; return end
+        if count == dash.failedCount then return end -- one scan per dash, never a scan loop
         local began = tick()
-        local entries = scanDashGc(tuner, { "cooldown", "dashCount", "dashRemaining", "recoveryRemaining", "travelHistory" }, now)
-        if not entries then return end
-        local owners, keys = {}, { cooldown = true, dashCount = true, dashRemaining = true, recoveryRemaining = true }
-        tuner.historySeeds = {}
-        local histories = {}
-        for _, entry in ipairs(entries) do
-            local owner, address = tonumber(entry.tbl), tonumber(entry.addr)
-            if entry.key == "travelHistory" and validAddress(address) then
-                local tag = memoryValue("int", address + 12)
-                if tag == 7 or tag == 8 then
-                    local reference = nodeKey(address, "travelHistory", nil, tag)
-                    local history = reference and memoryValue("uintptr_t", address)
-                    local signature = tostring(history) .. ":" .. tostring(reference) .. ":" .. tostring(tag)
-                    if validAddress(history) and history >= 65536 and not histories[signature] then
-                        histories[signature] = true
-                        tuner.historySeeds[#tuner.historySeeds + 1] = { history = history, historyRef = reference, historyTag = tag }
-                    end
-                end
-            end
-            if keys[entry.key] and entry.type == "number" and validAddress(owner) and validAddress(address) then
-                local group = owners[owner]
-                if not group then group = {}; owners[owner] = group end
-                if group[entry.key] and tonumber(group[entry.key].addr) ~= address then group.ambiguous = true end
-                group[entry.key] = entry
-            end
-        end
-        local retained, seen = {}, {}
-        local function retain(group)
-            local signature = tostring(group.cooldown.addr) .. ":" .. tostring(group.dashRemaining.addr)
-                .. ":" .. tostring(group.recoveryRemaining.addr) .. ":" .. tostring(group.dashCount and group.dashCount.addr)
-            if not seen[signature] then retained[#retained + 1] = group; seen[signature] = true end
-        end
-        for _, group in pairs(owners) do
-            if not group.ambiguous and group.cooldown and group.dashRemaining and group.recoveryRemaining then
-                retain(group)
-            end
-        end
-        for _, group in ipairs(tuner.stateGroups or {}) do
-            if #retained >= 32 then break end
-            retain(group)
-        end
-        tuner.stateGroups = retained
-        if not selectDashState(tuner.stateGroups, count, published) then
-            preparePortableDash(tuner, entries); prepareDashTracking(tuner)
+        local reason, fresh
+        track, reason, fresh = discoverDash(c, count)
+        if not track then
+            -- Back off after repeated misses so a hard-to-find table never costs a freeze on every dash.
+            dash.failures = dash.failures + 1
+            dash.failedCount, dash.nextScan = finite(fresh) and fresh or count, tick() + math.min(30, 2 ^ dash.failures)
+            dash.status = reason .. "; dash again to retry"
+            log(string.format("Dash state: %s (%.2fs)", reason, tick() - began)); return
         end
         now = tick()
-        tuner.nextStateScan = now + 1
-        tuner.stateGroup, tuner.gates, tuner.pinned, tuner.stateLost = nil, nil, nil, nil
-        tuner.stateRefreshActive, tuner.stateFaultAt = nil, nil
-        tuner.nodeSearch, tuner.nodeAttempted = nil, nil
-
-        tuner.completed, tuner.applied, tuner.corrected, tuner.writtenEntry, tuner.appliedAt = false, nil, nil, nil, nil
-        tuner.stateProbeCount, tuner.stateCandidates, tuner.stateObserved = nil, nil, nil
-        count, published, ready = attr(object, "DashCount"), attr(object, "DashCooldown"), attr(object, "DashReady")
-        log(string.format("Dash state scan: %d timer groups in %.2fs; game count %s", #tuner.stateGroups, now - began, tostring(count)))
-        if id(read(me, "Character")) ~= id(object) or not finite(count) or not finite(published) or type(ready) ~= "boolean" then return end
-        if tuner.portableScan then tuner.status = "Identifying dash tables without GC owner metadata"; return end
+        track.checkAt, track.misses, dash.failures = now + 2, 0, 0
+        dash.track, dash.lastCount = track, fresh
+        log(string.format("Dash state found @%s in %.2fs%s", tostring(track.header.address), tick() - began,
+            track.nodes.noBoost and "; no RunBoost fields" or ""))
     end
-    if count ~= tuner.dashCount then
-        tuner.dashCount, tuner.started, tuner.completed = count, now, false
-        tuner.applied, tuner.corrected, tuner.writtenEntry, tuner.appliedAt = nil, nil, nil, nil
-    end
-    if not tuner.stateGroup then
-        local selected, matches = selectDashState(tuner.stateGroups, count, published)
-        local waiting = false
-        if not selected and matches == 0 then selected, waiting = observeSplitDashState(tuner, count, published) end
-        if not selected then
-            if not waiting then tuner.status = tuner.portableStatus or (matches > 1 and "Dash state ambiguous; dash once to identify" or "Dash state missing; refresh when naturally ready") end
-
-            tuner.stateLost = tuner.stateFaultAt ~= nil or (matches == 0 and not waiting)
-            return
-        end
-        bindDashState(tuner, selected, count)
-    end
-    local group = tuner.stateGroup
-    local actualCount = count
-    if group.dashCount then actualCount = timerRead(group.dashCount, 1e12) end
-    local cooldown, motion, recovery = timerRead(group.cooldown), timerRead(group.dashRemaining), timerRead(group.recoveryRemaining)
-    local correlated = not group.correlated or tuner.stateValidatedCount == count
-    if group.localNodes then
-        for _, name in ipairs(dashKeys) do
-            local entry = group[name]
-            if not nodeKey(entry.addr, name, entry.keyRef) then
-                cooldown, motion = nil, nil; break
-            end
-        end
-    end
-    if not correlated and cooldown and cooldown > 0 and motion and motion > 0 and timerMatches(cooldown, published) then
-        tuner.stateValidatedCount, correlated = count, true
-    end
-    if actualCount ~= count or not cooldown or not motion or not recovery or not correlated then
-
-        tuner.stateFaultAt = tuner.stateFaultAt or now
-        tuner.status = "Waiting for consistent dash state; keeping cache"
-        local invalidAddress = (actualCount ~= nil and actualCount % 1 ~= 0)
-            or (cooldown == nil and motion == nil)
-            or (actualCount == nil and motion == nil)
-        if now - tuner.stateFaultAt < (invalidAddress and .05 or .25) then return end
-        tuner.stateGroup, tuner.gates, tuner.pinned, tuner.stateLost = nil, nil, nil, true
-
-        tuner.stateRefreshActive = invalidAddress or (not correlated and published > .16
-            and cooldown == 0 and motion == 0 and recovery == 0)
-        if tuner.stateRefreshActive then tuner.nextStateScan = now end
-        tuner.status = "Dash state moved or count changed; no write"
-        log("Dash state rejected: game count " .. count .. "; private "
-            .. (group.dashCount and tostring(actualCount) or ("ungrouped; last validated " .. tostring(tuner.stateValidatedCount)))
-            .. "; timers " .. tostring(cooldown) .. "/" .. tostring(motion) .. "/" .. tostring(recovery))
+    local base, size = headerNodes(track.header)
+    local moved = base and (base ~= track.base or size ~= track.size) and scanNodes(base, size)
+    if not base or moved == nil then
+        -- Mid-rehash (header bytes and node array change together) or a freed table: wait before giving up.
+        track.misses = track.misses + 1
+        if track.misses > 30 then loseDash("Dash state moved and was not found") end
         return
     end
-    tuner.stateFaultAt = nil
-    tuner.gates, tuner.pinned = group, group.cooldown
-    if not tuner.completed then
-        if cooldown > 0 then applyDashCap(tuner, group.cooldown, cooldown, now)
-        else
-            tuner.completed, tuner.applied, tuner.writtenEntry, tuner.appliedAt = true, 0, group.cooldown, now
-        end
-    elseif cooldown > .05 then
-        tuner.corrected = true; tuner.status = "Game replaced the timer; wait for the next natural dash"; return
+    if moved then track.base, track.size, track.nodes = base, size, moved end
+    local nodes = track.nodes
+    local count, remaining = number(nodes.dashCount), number(nodes.dashRemaining)
+    if not count or not remaining then track.base = nil; return end
+    track.misses = 0
+    dash.motion = remaining > 0
+    if now >= track.checkAt then
+        track.checkAt = now + 2
+        local published = attr(c, "DashCount")
+        track.mismatch = finite(published) and published ~= count and (track.mismatch or 0) + 1 or 0
+        if track.mismatch >= 2 then loseDash("Dash state stopped matching the game"); return end
     end
-    if tuner.corrected then return end
-    tuner.status = ready and "Dash ready (game reported)" or "Timer reset; release Space to re-arm"
-    dashRearmStep(tuner, object, now)
-end
-local function dashCooldownStep(tuner, object, now)
-    if type(getgc) ~= "function" or type(applygc) ~= "function" or type(memory_read) ~= "function" then
-        tuner.status = "Internal timer APIs unavailable"; return
+    if count ~= dash.lastCount then
+        dash.lastCount = count
+        if dash.longer then extendDash(track, count) end
     end
-    local count, published, ready = attr(object, "DashCount"), attr(object, "DashCooldown"), attr(object, "DashReady")
-    if not finite(count) or not finite(published) or type(ready) ~= "boolean" then
-        tuner.status = "Dash state unavailable"; return
+    if dash.infinite then
+        local cooldown, recovery = number(nodes.cooldown), number(nodes.recoveryRemaining)
+        if not cooldown or not recovery then track.base = nil; return end -- node moved: re-walk next frame
+        if cooldown and cooldown > 0 then writeNumber(track, "cooldown", 0) end
+        -- Recovery starts when the motion ends; clearing it then keeps the full (longer) dash.
+        if remaining <= 0 and recovery and recovery > 0 then writeNumber(track, "recoveryRemaining", 0) end
     end
-    if tuner.dashCount == nil or (tuner.refreshPending and ready and published <= 0) then
-
-        local entries = scanDashGc(tuner, "cooldown", now)
-        if not entries then return end
-        tuner.cache = {}
-        local seen = {}
-        for _, entry in ipairs(entries) do
-            local address, expected = tonumber(entry.addr), tonumber(entry.value)
-            if entry.key == "cooldown" and entry.type == "number" and validAddress(address)
-                and finite(expected) and not seen[address] then
-                seen[address] = true
-                local actual = timerRead(entry)
-                if finite(actual) and math.abs(actual - expected) <= .16 then
-                    tuner.cache[#tuner.cache + 1] = entry
-                end
-            end
-        end
-        tuner.dashCount = count; tuner.status = "Dash once to identify the timer"
-        tuner.refreshPending, tuner.completed, tuner.started = nil, false, nil
-        tuner.candidates, tuner.writtenEntry, tuner.applied = nil, nil, nil
-        log("Dash timer scan: " .. #tuner.cache .. " numeric entries")
-        return
-    end
-    if count ~= tuner.dashCount then
-        tuner.dashCount, tuner.started, tuner.completed = count, now, false
-        tuner.applied, tuner.corrected, tuner.observed = nil, nil, nil
-        tuner.writtenEntry, tuner.appliedAt = nil, nil
-        tuner.candidates = nil
-    end
-    if not tuner.started then tuner.status = "Dash once to identify the timer"; return end
-    if tuner.completed then
-        if tuner.applied then
-            if tuner.corrected then return end
-            local actual = timerRead(tuner.writtenEntry)
-            if not finite(actual) or actual > tuner.applied + .05 then
-                tuner.pinned = nil
-                tuner.refreshPending = true
-                tuner.status = "Internal timer changed; identifying again next dash"
-                if not tuner.corrected then tuner.corrected = true; log(tuner.status) end
-            elseif published <= tuner.applied + .16 then
-                if not tuner.pinned then
-                    tuner.pinned = tuner.writtenEntry
-                    log("Game confirmed dash timer; keeping address @" .. tostring(tuner.pinned.addr))
-                end
-                tuner.status = ready and "Dash ready (game reported)" or "Timer shortened; motion/recovery active"
-            elseif now - tuner.appliedAt < .3 then
-
-                tuner.status = "Waiting for game timer update"
-            else
-                tuner.pinned = nil
-                tuner.refreshPending = true
-                tuner.status = "Game timer did not follow; identifying again next dash"
-                if not tuner.corrected then tuner.corrected = true; log(tuner.status) end
-            end
-        else tuner.status = "No patch this dash; dash again to identify the timer" end
-        return
-    end
-    if published <= 0 or ready then
-
-        if now - tuner.started < .15 then tuner.status = "Waiting for dash timer"; return end
-        tuner.completed = true; tuner.status = "Natural timer finished"; return
-    end
-    if attr(object, "MovementLocked") == true then tuner.status = "Movement locked; waiting"; return end
-    if tuner.pinned then
-        local actual = timerRead(tuner.pinned)
-        if actual and actual > 0 and timerMatches(actual, published) then
-            applyDashCap(tuner, tuner.pinned, actual, now); return
-        end
-
-        tuner.pinned = nil
-        tuner.refreshPending = true
-        log("Confirmed dash timer changed; identifying again")
-    end
-    if not tuner.candidates then
-        tuner.candidates, tuner.observed = {}, published
-        for _, entry in ipairs(tuner.cache or {}) do
-            local actual = timerRead(entry)
-            if timerMatches(actual, published) then
-                tuner.candidates[#tuner.candidates + 1] = { entry = entry, last = actual, matches = 1 }
-            end
-        end
-        log("Dash " .. count .. ": " .. #tuner.candidates .. " internal timer candidates")
-    end
-    if tuner.observed ~= published then
-        tuner.observed = published
-        local survivors = {}
-        for _, candidate in ipairs(tuner.candidates or {}) do
-            local actual = timerRead(candidate.entry)
-            if timerMatches(actual, published) and candidate.last - actual > .015 then
-                candidate.last, candidate.matches = actual, candidate.matches + 1
-                survivors[#survivors + 1] = candidate
-            end
-        end
-        tuner.candidates = survivors
-    end
-    local candidates = tuner.candidates or {}
-    if #candidates ~= 1 or candidates[1].matches < 3 then
-        tuner.status = #candidates == 0 and "Timer not identified; no write"
-            or (#candidates > 1 and "Timer ambiguous; no write" or "Identifying internal timer")
-        return
-    end
-    local candidate = candidates[1]
-    local before = timerRead(candidate.entry)
-    if not timerMatches(before, published) then tuner.completed = true; tuner.status = "Timer changed; no write"; return end
-
-    applyDashCap(tuner, candidate.entry, before, now)
-end
-local function cooldownStep(c, now)
-    for _, tuner in ipairs(cooldownTuners) do
-        if tuner.enabled then
-            local object = me
-            if tuner.character then object = c end
-            if id(object) ~= id(tuner.object) then restoreCooldown(tuner); tuner.object = object end
-            if not object then tuner.status = "Waiting for character"
-            else
-                local success, err = pcall(function()
-                    if tuner.rearm and tuner.seconds == 0 then dashStateStep(tuner, object, now)
-                    else dashCooldownStep(tuner, object, now) end
-                end)
-                if not success then
-                    tuner.enabled = false; tuner.control:SetValue(false, true)
-                    restoreCooldown(tuner); tuner.status = "Write rejected; tuning stopped"
-                    log(tuner.name .. " cooldown: " .. tostring(err)); notify("Cooldown tuning stopped", tuner.name .. ": write rejected")
-                end
-            end
-        end
-    end
+    dash.status = remaining > 0 and "Dashing" or "Ready: turn + Space to dash"
 end
 local function movementDirection(humanoid)
     local forward = (key(0x57) and 1 or 0) - (key(0x53) and 1 or 0)
@@ -1079,7 +428,6 @@ local function movementDirection(humanoid)
 end
 local function movementStep(c, root, now)
     if not state.speed then movementStatus = "Off"; return end
-    if attr(c, "MovementLocked") ~= false then movementStatus = "Paused: movement lock/unknown"; return end
     if type(isrbxactive) == "function" then
         local active, focused = pcall(isrbxactive)
         if not active or not focused then movementStatus = "Paused: Roblox not focused"; return end
@@ -1101,14 +449,21 @@ local function movementStep(c, root, now)
     end
     local target, direction, directionLength
     if state.speed then
-        local movementState = attr(c, "MovementState")
-        if movementState == "Dashing" or movementState == "Dash" or movementState == "Boosting" then
-            movementStatus = "Paused: natural dash motion"; return
-        end
         direction = movementDirection(humanoid)
         if not direction or horizontal(direction) < .01 then
             pendingVelocity = nil; movementStatus = "Paused: no movement direction"; return
         end
+        -- Attributes cost ~0.8ms each in Matcha, so they are read only on frames that are about to write,
+        -- and the dash tracker's memory read replaces MovementState whenever a dash feature is on.
+        local dashing = dash.motion
+        if dashing == nil then
+            local movementState = attr(c, "MovementState")
+            dashing = movementState == "Dashing" or movementState == "Dash" or movementState == "Boosting"
+        end
+        if dashing then
+            movementStatus = "Paused: natural dash motion"; return
+        end
+        if attr(c, "MovementLocked") ~= false then movementStatus = "Paused: movement lock/unknown"; return end
         target = math.min(state.target, MAX_SPEED); directionLength = horizontal(direction)
         -- Ramp instead of snapping: an instant jump reads to the server as a teleport and gets rubber-banded.
         local dt, base = now - lastWriteAt, lastWritten
@@ -1139,8 +494,8 @@ local function step()
         characterId = id(c); pendingVelocity = nil; lastWritten = 0
         movementStatus = "Character changed"
     end
+    dashStep(c, now) -- first, so speed tuning sees this frame's dash motion
     if root then movementStep(c, root, now) else movementStatus = "Waiting for character" end
-    cooldownStep(c, now)
     if now >= nextLabels then
         nextLabels = now + .2
         for _, label in ipairs(liveLabels) do label.control:SetDescription(label.provider()) end
@@ -1159,7 +514,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.21 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.23 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end

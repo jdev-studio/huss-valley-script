@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.23 - 2026-10-06
+
+- New **Dash distance** section on the Movement tab: **Longer dash** toggle, **Dash distance** slider (1.1x to 3x, default 1.5x) and a **Distance status** line. Each dash travels that many times its normal distance; the game still moves you along its own dash curve.
+- **Infinite dash (no cooldown)** now lets the whole dash finish, then clears the cooldown, so it works together with Longer dash. You no longer need to release Space; press Space and turn to dash again.
+- Much less lag: the dash features read the game's movement state straight from memory instead of reading character attributes every frame (about 0.03 ms per frame instead of about 10 ms).
+- After respawning, do one normal dash; the script then pauses for about a second while it finds the movement state. It keeps following it after that, without the repeated multi-second scans of earlier builds.
+- Longer dashes are faster dashes, so the server may pull you back at high multipliers; lower the slider if that happens.
+
 ## 0.6.21 - 2026-10-06
 
 - Speed tuning no longer switches itself off when the game corrects your position. Corrections are ignored and the speed stays where you set it.
