@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.21 - 2026-10-06
+
+- Speed tuning no longer switches itself off when the game corrects your position. Corrections are ignored and the speed stays where you set it.
+- Travel speed is capped at 45 studs/s (was 80). Saved values above 45 load as 45.
+- Speed ramps up over about a quarter second instead of jumping to full speed in one frame.
+- A few unreadable or rejected velocity frames no longer turn speed off; it only stops if they keep failing for about a second. One bad frame no longer stops the whole script.
+- Infinite dash is now one toggle, **Infinite dash (no cooldown)**, replacing Tune Dash, Dash max cooldown and Re-arm dash on Space release. Turn it on once after updating; the old dash settings don't carry over.
+- Speed and dash are on the same Movement tab. The Dash tab is gone.
+
 ## 0.6.20 - 2026-10-05
 
 - Stop speed tuning before its next velocity write when the game's MovementReset counter increases. Previously the script only logged the correction and kept forcing the same speed, allowing repeated corrections.

@@ -7,7 +7,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/jdev-studio/huss-vall
 ```
 
 - **Right Shift** opens or hides the menu.
-- For infinite dash, enable **Tune Dash** and **Re-arm dash on Space release**, with **Dash max cooldown** set to `0`. Release Space and change direction between dashes.
+- For infinite dash, turn on **Infinite dash (no cooldown)** on the Movement tab. Release Space and change direction between dashes.
 - Enable **unsafe Lua execution** in Matcha for dash tuning.
 - Settings save automatically and restore when you reload.
 

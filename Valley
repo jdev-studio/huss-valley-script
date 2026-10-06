@@ -76,8 +76,10 @@ local app = { alive = true, ui = ui }
 rawset(_G, "ValleyJDUI", app)
 local state = { speed = false, target = 36 }
 local controls, liveLabels, cooldownTuners = {}, {}, {}
-local connection, characterId, lastMovementReset
+local connection, characterId
 local pendingVelocity
+local MAX_SPEED = 45
+local lastWriteAt, lastWritten, moveFails = 0, 0, 0
 local movementStatus = "Off"
 local nextLabels, nextLog = 0, 0
 local logLines = {}
@@ -167,8 +169,7 @@ end
 ui.Title = "Huss Valley"
 ui:SetLayout("Compact")
 local movement = ui:AddTab({ Title = "Movement", Icon = "bolt" })
-local dashing = ui:AddTab({ Title = "Dash", Icon = "bolt", Columns = 1 })
-ui.Tabs = { movement, dashing, ui.Settings }
+ui.Tabs = { movement, ui.Settings }
 for i = #ui.Settings.Controls, 1, -1 do
     if ui.Settings.Controls[i].Title == "Test notification" then table.remove(ui.Settings.Controls, i) end
 end
@@ -193,30 +194,23 @@ local function slider(tab, title, feature, lo, hi, step, suffix)
     return c
 end
 toggle(movement, "Speed tuning", "speed", "Uses movement input; preserves falling/jumping velocity")
-slider(movement, "Travel speed", "target", 10, 80, 1, " studs/s")
+slider(movement, "Travel speed", "target", 10, MAX_SPEED, 1, " studs/s")
 local cooldownFields = { { name = "Dash", character = true, dash = true } }
 for _, field in ipairs(cooldownFields) do
     local tuner = { name = field.name, character = field.character, key = field.key, dash = field.dash,
         enabled = false, seconds = 0, status = "Off" }
     cooldownTuners[#cooldownTuners + 1] = tuner
-    local tab = dashing
+    local tab = movement
+    app.dash, app.restoreDash = tuner, restoreCooldown -- lets tools/valley_test.js drive the timer engine directly
     local group = tab:AddIsland({ Title = field.name .. " cooldown" })
-    tuner.control = group:AddToggle({ Title = "Tune " .. field.name, Default = false,
+    -- One switch for the full no-cooldown path (timer reset + re-arm on Space release).
+    tuner.control = group:AddToggle({ Title = "Infinite dash (no cooldown)", Default = false,
+        Description = "Dash again as soon as you release Space",
         Callback = function(on)
-            tuner.enabled = on
-            if not on then restoreCooldown(tuner); tuner.status = "Off" end
+            restoreCooldown(tuner)
+            tuner.enabled, tuner.seconds, tuner.rearm = on, 0, on
+            if not on then tuner.status = "Off" end
         end })
-    group:AddSlider({ Title = field.name .. " max cooldown", Min = 0, Max = 15, Step = .1, Default = 0, Suffix = " s",
-        Description = "0 = timer reset; enable release re-arm to end motion/recovery early",
-        Callback = function(seconds) tuner.seconds = seconds end })
-    if field.dash then
-        group:AddToggle({ Title = "Re-arm dash on Space release", Default = false,
-            Description = "Experimental: ends the current dash early; turn again before the next Space press",
-            Callback = function(on)
-                restoreCooldown(tuner)
-                tuner.rearm = on
-            end })
-    end
     liveLabel(group, "Write status", function() return tuner.status end)
 end
 ui:SetConfig("huss_valley_config")
@@ -1084,14 +1078,6 @@ local function movementDirection(humanoid)
         look.Z / lookLength * forward + right.Z / rightLength * side)
 end
 local function movementStep(c, root, now)
-    local reset = attr(c, "MovementReset")
-    if finite(reset) and finite(lastMovementReset) and reset > lastMovementReset then
-        pendingVelocity = nil
-        if state.speed then
-            disable("speed", "Game corrected movement; reduce Travel speed before enabling again")
-        end
-    end
-    lastMovementReset = reset
     if not state.speed then movementStatus = "Off"; return end
     if attr(c, "MovementLocked") ~= false then movementStatus = "Paused: movement lock/unknown"; return end
     if type(isrbxactive) == "function" then
@@ -1103,7 +1089,9 @@ local function movementStep(c, root, now)
     if not finite(health) or health <= 0 then movementStatus = "Paused: no living character"; return end
     local v = read(root, "AssemblyLinearVelocity")
     if not vector(v) then
-        if state.speed then disable("speed", "Velocity unavailable") end
+        -- One bad external read is common; only give up when it keeps failing (~1s).
+        moveFails = moveFails + 1; movementStatus = "Velocity unavailable"
+        if moveFails >= 60 then moveFails = 0; disable("speed", "Velocity unavailable") end
         return
     end
     local magnitude = horizontal(v)
@@ -1121,7 +1109,11 @@ local function movementStep(c, root, now)
         if not direction or horizontal(direction) < .01 then
             pendingVelocity = nil; movementStatus = "Paused: no movement direction"; return
         end
-        target = state.target; directionLength = horizontal(direction)
+        target = math.min(state.target, MAX_SPEED); directionLength = horizontal(direction)
+        -- Ramp instead of snapping: an instant jump reads to the server as a teleport and gets rubber-banded.
+        local dt, base = now - lastWriteAt, lastWritten
+        if dt < 0 or dt > .1 then dt, base = 1 / 60, 0 end
+        target = math.min(target, math.max(magnitude, base) + 90 * dt)
     end
     if not target then return end
     local success, err = pcall(function()
@@ -1129,9 +1121,11 @@ local function movementStep(c, root, now)
             direction.Z / directionLength * target)
     end)
     if not success then
-        if state.speed then disable("speed", "Velocity write rejected") end
-        movementStatus = "Write rejected"; log(tostring(err)); return
+        moveFails = moveFails + 1; movementStatus = "Write rejected"
+        if moveFails >= 60 then moveFails = 0; disable("speed", "Velocity write rejected"); log(tostring(err)) end
+        return
     end
+    moveFails, lastWriteAt, lastWritten = 0, now, target
     if not pendingVelocity then pendingVelocity = { at = now, target = target } end
 end
 local function step()
@@ -1142,9 +1136,8 @@ local function step()
     local c = read(me, "Character")
     local root = child(c, "HumanoidRootPart")
     if id(c) ~= characterId then
-        characterId = id(c); pendingVelocity = nil
+        characterId = id(c); pendingVelocity = nil; lastWritten = 0
         movementStatus = "Character changed"
-        lastMovementReset = attr(c, "MovementReset")
     end
     if root then movementStep(c, root, now) else movementStatus = "Waiting for character" end
     cooldownStep(c, now)
@@ -1157,11 +1150,16 @@ local function step()
         log("Movement " .. movementStatus)
     end
 end
+local stepErrors = 0
 connection = frame:Connect(function()
     local success, err = pcall(step)
-    if not success then log("Runtime error: " .. tostring(err)); app.stop() end
+    if success then stepErrors = 0; return end
+    -- A single bad frame (flaky external read) must not kill the script; stop only if it keeps failing.
+    stepErrors = stepErrors + 1
+    if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
+    if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.20 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.21 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
