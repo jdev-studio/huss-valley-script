@@ -150,7 +150,8 @@ end
 ui.Title = "Huss Valley"
 ui:SetLayout("Compact")
 local movement = ui:AddTab({ Title = "Movement", Icon = "bolt" })
-ui.Tabs = { movement, ui.Settings }
+local reachTab = ui:AddTab({ Title = "Hitbox", Icon = "spark" })
+ui.Tabs = { movement, reachTab, ui.Settings }
 for i = #ui.Settings.Controls, 1, -1 do
     if ui.Settings.Controls[i].Title == "Test notification" then table.remove(ui.Settings.Controls, i) end
 end
@@ -178,6 +179,8 @@ toggle(movement, "Speed tuning", "speed", "Uses movement input; preserves fallin
 slider(movement, "Travel speed", "target", 10, MAX_SPEED, 1, " studs/s")
 local dash = { infinite = false, longer = false, scale = 1.5, status = "Off", boost = "Off" }
 app.dashState = dash -- lets tools/valley_test.js inspect the shared tracker
+local reach = { enabled = false, extra = 7, auto = false, status = "Off" }
+app.reach = reach
 local cooldownGroup = movement:AddIsland({ Title = "Dash cooldown" })
 cooldownGroup:AddToggle({ Title = "Infinite dash (no cooldown)", Default = false,
     Description = "Dash again as soon as the dash ends",
@@ -189,6 +192,16 @@ distanceGroup:AddToggle({ Title = "Longer dash", Default = false, Description = 
 distanceGroup:AddSlider({ Title = "Dash distance", Min = 1.1, Max = 3, Step = .1, Default = dash.scale, Suffix = "x",
     Callback = function(v) dash.scale = v end })
 liveLabel(distanceGroup, "Distance status", function() return dash.longer and (dash.track and dash.boost or dash.status) or "Off" end)
+local reachGroup = reachTab:AddIsland({ Title = "Tackle reach" })
+reachGroup:AddToggle({ Title = "Extended tackle reach", Default = false,
+    Description = "Press F to tackle the nearest runner in reach",
+    Callback = function(on) reach.enabled = on end })
+reachGroup:AddSlider({ Title = "Extra reach", Min = 1, Max = 9, Step = 1, Default = reach.extra, Suffix = " studs",
+    Callback = function(v) reach.extra = v end })
+reachGroup:AddToggle({ Title = "Auto tackle", Default = false,
+    Description = "Tackle automatically when a runner is in reach",
+    Callback = function(on) reach.auto = on end })
+liveLabel(reachGroup, "Reach status", function() return reach.status end)
 ui:SetConfig("huss_valley_config")
 movement:Select()
 -- Both dash features share one view of the game's private movement table (MovementModel state).
@@ -483,6 +496,154 @@ local function movementStep(c, root, now)
     moveFails, lastWriteAt, lastWritten = 0, now, target
     if not pendingVelocity then pendingVelocity = { at = now, target = target } end
 end
+local lastOs, unixOffset = os.time()
+local function guid()
+    local chars = {}
+    for i = 1, 32 do chars[i] = string.format("%x", math.random(0, 15)) end
+    local value = table.concat(chars)
+    return value:sub(1, 8) .. "-" .. value:sub(9, 12) .. "-" .. value:sub(13, 16) .. "-" ..
+        value:sub(17, 20) .. "-" .. value:sub(21, 32)
+end
+local function service(name)
+    local success, value = pcall(function() return game:GetService(name) end)
+    if success then return value end
+end
+local function getPlayers()
+    local success, list = pcall(function() return players:GetPlayers() end)
+    if success and type(list) == "table" then return list end
+    return {}
+end
+local function dotDelta(pos, origin, axis)
+    return (pos.X - origin.X) * axis.X + (pos.Y - origin.Y) * axis.Y + (pos.Z - origin.Z) * axis.Z
+end
+local function reloadSafeZones(now)
+    if now < (reach.safeAt or 0) then return end
+    reach.safeAt = now + 5
+    local zones = {}
+    local success, maps = pcall(function() return world:GetChildren() end)
+    if success and type(maps) == "table" then
+        for _, map in ipairs(maps) do
+            local field = child(map, "Field")
+            local ok, parts = field and pcall(function() return field:GetChildren() end)
+            if ok and type(parts) == "table" then
+                for _, part in ipairs(parts) do
+                    if tostring(read(part, "Name")):find("Safezone") then
+                        local cf = read(part, "CFrame")
+                        local zone = { size = read(part, "Size"), origin = read(part, "Position"),
+                            right = read(cf, "RightVector"), look = read(cf, "LookVector"), up = read(cf, "UpVector") }
+                        if vector(zone.size) and vector(zone.origin) and vector(zone.right) and vector(zone.look)
+                            and vector(zone.up) then zones[#zones + 1] = zone end
+                    end
+                end
+            end
+        end
+    end
+    reach.safeZones = zones
+end
+local function inSafeZone(pos)
+    for _, zone in ipairs(reach.safeZones or {}) do
+        local size, origin, right, look, up = zone.size, zone.origin, zone.right, zone.look, zone.up
+        if math.abs(dotDelta(pos, origin, right)) <= size.X / 2 + 2
+            and math.abs(dotDelta(pos, origin, look)) <= size.Z / 2 + 2
+            and math.abs(dotDelta(pos, origin, up)) <= size.Y / 2 + 6 then return true end
+    end
+    return false
+end
+local function updateReachCaches(c, now)
+    local osNow = os.time()
+    if osNow ~= lastOs then
+        lastOs = osNow
+        unixOffset = lastOs - now
+    end
+    reloadSafeZones(now)
+    local character = id(c)
+    if now >= (reach.selfAt or 0) or character ~= reach.selfCharacter then
+        reach.selfAt, reach.selfCharacter = now + .25, character
+        reach.role, reach.run, reach.ready = attr(me, "GameRole"), attr(me, "RunState"), attr(me, "TackleReadyAt")
+        reach.locked = attr(c, "MovementLocked")
+    end
+    local list = getPlayers()
+    reach.players = list
+    if #list > 0 then
+        local index = (reach.playerIndex or 0) + 1
+        if index > #list then index = 1 end
+        reach.playerIndex = index
+        local player = list[index]
+        reach.roleCache = reach.roleCache or {}
+        reach.roleCache[player] = { role = attr(player, "GameRole"), run = attr(player, "RunState") }
+    end
+end
+local function reachTarget(root)
+    local myPos = read(root, "Position")
+    if not vector(myPos) then return end
+    local best, bestDistance, bestRoot
+    for _, player in ipairs(reach.players or {}) do
+        local cached = reach.roleCache and reach.roleCache[player]
+        if player ~= me and cached and cached.role == "Runner" and cached.run == "Active" then
+            local targetRoot = child(read(player, "Character"), "HumanoidRootPart")
+            local pos = read(targetRoot, "Position")
+            if vector(pos) and not inSafeZone(pos) then
+                local dx, dz = pos.X - myPos.X, pos.Z - myPos.Z
+                local distance = math.sqrt(dx * dx + dz * dz)
+                if distance > .01 and distance <= reach.extra + 4.5 and (not bestDistance or distance < bestDistance) then
+                    best, bestDistance, bestRoot = player, distance, targetRoot
+                end
+            end
+        end
+    end
+    return best, bestDistance, bestRoot
+end
+local function tackleRemote()
+    if reach.remote then return reach.remote end
+    local storage = service("ReplicatedStorage")
+    reach.remote = child(child(child(storage, "ChickenOrHero"), "Game"), "GameAction")
+    return reach.remote
+end
+local function reachStep(c, now)
+    if not reach.enabled then reach.status, reach.fDown = "Off", false; return end
+    updateReachCaches(c, now)
+    local fDown = key(0x46)
+    local wantsTackle = reach.auto or (fDown and not reach.fDown)
+    reach.fDown = fDown
+    if type(isrbxactive) == "function" then
+        local active, focused = pcall(isrbxactive)
+        if not active or not focused then reach.status = "Paused: Roblox not focused"; return end
+    end
+    if reach.role ~= "Catcher" or reach.run ~= "Active" then reach.status = "Waiting: be an active Catcher"; return end
+    if reach.locked == true then reach.status = "Waiting: movement locked"; return end
+    local unixNow = unixOffset and now + unixOffset
+    if not unixNow then reach.status = "Syncing server clock"; return end
+    if finite(reach.ready) and reach.ready > unixNow then reach.status = "Waiting: tackle ready"; return end
+    local root = child(c, "HumanoidRootPart")
+    if not root then reach.status = "Waiting for character"; return end
+    local target, distance, targetRoot = reachTarget(root)
+    if not target then reach.status = "No runner in reach"; return end
+    if not wantsTackle then
+        reach.status = string.format("Runner in reach: %s (%.1f studs)", tostring(read(target, "Name") or "Runner"), distance)
+        return
+    end
+    if now < (reach.nextFire or 0) then return end
+    local myPos, targetPos = read(root, "Position"), read(targetRoot, "Position")
+    local velocity = read(root, "AssemblyLinearVelocity")
+    if not vector(myPos) or not vector(targetPos) then reach.status = "Position unavailable"; return end
+    local dx, dz = targetPos.X - myPos.X, targetPos.Z - myPos.Z
+    local length = math.sqrt(dx * dx + dz * dz)
+    if length <= .01 then return end
+    local direction = Vector3.new(dx / length, 0, dz / length)
+    local shift = math.max(0, math.min(reach.extra, distance - 3))
+    local position = Vector3.new(myPos.X + direction.X * shift, myPos.Y, myPos.Z + direction.Z * shift)
+    local speed = vector(velocity) and horizontal(velocity) or 0
+    local name = tostring(read(target, "Name") or "Runner")
+    local success = pcall(function()
+        assert(tackleRemote(), "remote unavailable"):FireServer("Tackle", {
+            id = guid(), at = unixNow, speed = speed, direction = direction, position = position
+        })
+    end)
+    if not success then reach.status = "Needs Matcha hybrid mode (remote calls)"; return end
+    reach.nextFire = now + 1
+    reach.status = string.format("Tackled %s from %.1f studs", name, distance)
+    log(reach.status)
+end
 local function step()
     if not app.alive then return end
     if not ui.Alive then app.stop(); return end
@@ -495,6 +656,7 @@ local function step()
         movementStatus = "Character changed"
     end
     dashStep(c, now) -- first, so speed tuning sees this frame's dash motion
+    reachStep(c, now)
     if root then movementStep(c, root, now) else movementStatus = "Waiting for character" end
     if now >= nextLabels then
         nextLabels = now + .2
@@ -514,7 +676,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.23 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.24 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
