@@ -76,8 +76,6 @@ local app = { alive = true, ui = ui }
 rawset(_G, "ValleyJDUI", app)
 local state = { speed = false, target = 36 }
 local controls, liveLabels = {}, {}
-local restoreHitbox
-local hitboxCircles = {}
 local connection, characterId
 local pendingVelocity
 local MAX_SPEED = 45
@@ -143,11 +141,6 @@ function app.stop()
     if not app.alive then return end
     app.alive = false
     if connection then connection:Disconnect() end
-    if restoreHitbox then restoreHitbox() end
-    for _, circle in ipairs(hitboxCircles) do
-        pcall(function() circle:Remove() end)
-    end
-    hitboxCircles = {}
     if ui.Alive then ui:Destroy() end
     if rawget(_G, "ValleyJDUI") == app then rawset(_G, "ValleyJDUI", nil) end
     log("Stopped; movement writes ended; settings saved")
@@ -157,8 +150,7 @@ end
 ui.Title = "Huss Valley"
 ui:SetLayout("Compact")
 local movement = ui:AddTab({ Title = "Movement", Icon = "bolt" })
-local hitboxTab = ui:AddTab({ Title = "Hitbox", Icon = "spark" })
-ui.Tabs = { movement, hitboxTab, ui.Settings }
+ui.Tabs = { movement, ui.Settings }
 for i = #ui.Settings.Controls, 1, -1 do
     if ui.Settings.Controls[i].Title == "Test notification" then table.remove(ui.Settings.Controls, i) end
 end
@@ -197,16 +189,6 @@ distanceGroup:AddToggle({ Title = "Longer dash", Default = false, Description = 
 distanceGroup:AddSlider({ Title = "Dash distance", Min = 1.1, Max = 3, Step = .1, Default = dash.scale, Suffix = "x",
     Callback = function(v) dash.scale = v end })
 liveLabel(distanceGroup, "Distance status", function() return dash.longer and (dash.track and dash.boost or dash.status) or "Off" end)
-local hitbox = { enabled = false, show = true, scale = 2, status = "Off", entries = nil }
-local hitboxGroup = hitboxTab:AddIsland({ Title = "Hitbox" })
-hitboxGroup:AddToggle({ Title = "Bigger runner hitbox", Default = false, Description = "Tackles count runners as wider",
-    Callback = function(on) hitbox.enabled = on end })
-hitboxGroup:AddSlider({ Title = "Hitbox size", Min = 1, Max = 4, Step = .25, Default = hitbox.scale, Suffix = "x",
-    Callback = function(v) hitbox.scale = v end })
-hitboxGroup:AddToggle({ Title = "Show hitboxes", Default = true, Description = "Outline around each runner",
-    Callback = function(on) hitbox.show = on end })
-liveLabel(hitboxGroup, "Hitbox status", function() return hitbox.status end)
-app.hitbox = hitbox
 ui:SetConfig("huss_valley_config")
 movement:Select()
 -- Both dash features share one view of the game's private movement table (MovementModel state).
@@ -501,132 +483,6 @@ local function movementStep(c, root, now)
     moveFails, lastWriteAt, lastWritten = 0, now, target
     if not pendingVelocity then pendingVelocity = { at = now, target = target } end
 end
-local function hitboxNode(address)
-    local tag = memoryValue("int", address + 28)
-    if not finite(tag) or tag % 16 ~= 6 then return end
-    local pointer = memoryValue("uintptr_t", address + 16)
-    if not validAddress(pointer) or pointer < 65536 then return end
-    if memoryValue("int", pointer + 20) ~= 12 then return end
-    if memoryValue("string", pointer + 24) ~= "RunnerRadius" then return end
-    local value = number(address)
-    if value and value >= .1 and value <= 10 then return pointer, value end
-end
-local function restoreHitboxEntry(entry)
-    if memoryValue("uintptr_t", entry.addr + 16) ~= entry.key then return false end
-    local written = pcall(memory_write, "double", entry.addr, entry.original)
-    local after = memoryValue("double", entry.addr)
-    return written and finite(after) and math.abs(after - entry.original) <= 1e-6
-end
-restoreHitbox = function()
-    if not hitbox.entries then return end
-    for _, entry in ipairs(hitbox.entries) do restoreHitboxEntry(entry) end
-    hitbox.entries, hitbox.applied = nil, nil
-    hitbox.status = "Off"
-end
-local function scanHitbox()
-    if type(getgc) ~= "function" or type(memory_read) ~= "function" or type(memory_write) ~= "function" then
-        hitbox.status = "Enable unsafe Lua execution in Matcha"; return
-    end
-    local success, entries = pcall(getgc, { "RunnerRadius" })
-    local found = {}
-    if success and type(entries) == "table" then
-        for _, entry in ipairs(entries) do
-            local address = type(entry) == "table" and entry.type == "number" and validAddress(tonumber(entry.addr)) and tonumber(entry.addr)
-            local key, value
-            if address then key, value = hitboxNode(address) end
-            if key then found[#found + 1] = { addr = address, key = key, original = value } end
-        end
-    end
-    hitbox.entries = found
-    if #found == 0 then hitbox.status = "No hitbox config found" end
-    log("Hitbox: " .. tostring(#found) .. " tables")
-end
-local function hitboxStep()
-    if not hitbox.enabled then
-        if hitbox.entries ~= nil then restoreHitbox() end
-        return
-    end
-    if hitbox.entries == nil then scanHitbox() end
-    local entries = hitbox.entries
-    if not entries or #entries == 0 or hitbox.applied == hitbox.scale then return end
-    local successes, first = 0, entries[1].original
-    for _, entry in ipairs(entries) do
-        if memoryValue("uintptr_t", entry.addr + 16) == entry.key then
-            local value = entry.original * hitbox.scale
-            local written = pcall(memory_write, "double", entry.addr, value)
-            local after = memoryValue("double", entry.addr)
-            if written and finite(after) and math.abs(after - value) <= 1e-6 then successes = successes + 1 end
-        end
-    end
-    hitbox.applied = hitbox.scale
-    hitbox.status = string.format("%d tables: %.2f -> %.2f studs", successes, first, first * hitbox.scale)
-end
-local hitboxTargets, nextHitboxTargetScan = {}, 0
-local function hideHitboxCircles(from)
-    for i = from or 1, #hitboxCircles do hitboxCircles[i].Visible = false end
-end
-local function hitboxCircle(index)
-    local circle = hitboxCircles[index]
-    if circle then return circle end
-    local success, made = pcall(function() return Drawing.new("Circle") end)
-    if not success or not made then return end
-    circle = made
-    circle.Color = Color3.fromRGB(255, 70, 70)
-    circle.Thickness = 2
-    circle.NumSides = 32
-    circle.Filled = false
-    circle.Transparency = 1
-    circle.ZIndex = 2
-    hitboxCircles[index] = circle
-    return circle
-end
-local function hitboxDrawStep(now)
-    if not (hitbox.enabled and hitbox.show) or type(Drawing) ~= "table" or type(Drawing.new) ~= "function"
-        or type(WorldToScreen) ~= "function" then
-        hideHitboxCircles()
-        return
-    end
-    if now >= nextHitboxTargetScan then
-        nextHitboxTargetScan = now + 1
-        hitboxTargets = {}
-        local success, list = pcall(function() return players:GetPlayers() end)
-        if success and type(list) == "table" then
-            for _, player in ipairs(list) do
-                if player ~= me and attr(player, "GameRole") == "Runner" then hitboxTargets[#hitboxTargets + 1] = player end
-            end
-        end
-    end
-    local camera = read(world, "CurrentCamera")
-    local cf = read(camera, "CFrame")
-    local right = read(cf, "RightVector")
-    if not vector(right) then hideHitboxCircles(); return end
-    local entries = hitbox.entries
-    local radiusStuds = ((entries and entries[1] and entries[1].original) or .9) * hitbox.scale
-    local used = 0
-    for _, player in ipairs(hitboxTargets) do
-        local success, pos = pcall(function()
-            local c = read(player, "Character")
-            local root = child(c, "HumanoidRootPart")
-            return read(root, "Position")
-        end)
-        if success and vector(pos) then
-            local sp, on = WorldToScreen(pos)
-            local edge = pos + right * radiusStuds
-            local edgeScreen = WorldToScreen(edge)
-            if on and finite(read(sp, "X")) and finite(read(sp, "Y"))
-                and finite(read(edgeScreen, "X")) and finite(read(edgeScreen, "Y")) then
-                used = used + 1
-                local circle = hitboxCircle(used)
-                if circle then
-                    circle.Position = sp
-                    circle.Radius = math.max(3, (edgeScreen - sp).Magnitude)
-                    circle.Visible = true
-                end
-            end
-        end
-    end
-    hideHitboxCircles(used + 1)
-end
 local function step()
     if not app.alive then return end
     if not ui.Alive then app.stop(); return end
@@ -639,8 +495,6 @@ local function step()
         movementStatus = "Character changed"
     end
     dashStep(c, now) -- first, so speed tuning sees this frame's dash motion
-    hitboxStep()
-    hitboxDrawStep(now)
     if root then movementStep(c, root, now) else movementStatus = "Waiting for character" end
     if now >= nextLabels then
         nextLabels = now + .2
@@ -660,7 +514,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.25 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.23 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
