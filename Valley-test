@@ -194,7 +194,7 @@ distanceGroup:AddSlider({ Title = "Dash distance", Min = 1.1, Max = 3, Step = .1
 liveLabel(distanceGroup, "Distance status", function() return dash.longer and (dash.track and dash.boost or dash.status) or "Off" end)
 local lungeGroup = reachTab:AddIsland({ Title = "Lunge lock-on" })
 lungeGroup:AddToggle({ Title = "Lunge lock-on", Default = false,
-    Description = "Space/E lunges steer into the nearest runner",
+    Description = "Faces a nearby runner, then leads and steers Space/E lunges",
     Callback = function(on) lunge.enabled = on end })
 lungeGroup:AddSlider({ Title = "Extra lunge", Min = 1, Max = 8, Step = .5, Default = lunge.extra, Suffix = " studs",
     Callback = function(v) lunge.extra = v end })
@@ -438,6 +438,9 @@ local function movementDirection(humanoid)
 end
 local function movementStep(c, root, now)
     if not state.speed then movementStatus = "Off"; return end
+    if lunge.active or child(root, "LocalTackleVelocity") then
+        pendingVelocity = nil; movementStatus = "Paused: tackle lunge"; return
+    end
     if type(isrbxactive) == "function" then
         local active, focused = pcall(isrbxactive)
         if not active or not focused then movementStatus = "Paused: Roblox not focused"; return end
@@ -544,14 +547,17 @@ local function updateReachCaches(c, now)
         lunge.nextSafeZones = now + 5
         reloadSafeZones()
     end
-    local list = getPlayers()
-    lunge.players = list
+    if now >= (lunge.nextPlayers or 0) then
+        lunge.nextPlayers = now + .25
+        lunge.players = getPlayers()
+    end
+    local list = lunge.players
     lunge.roles = lunge.roles or {}
     if #list > 0 then
         lunge.roleIndex = (lunge.roleIndex or 0) % #list + 1
         local player = list[lunge.roleIndex]
         local active, run = activeState(player)
-        lunge.roles[id(player)] = { role = attr(player, "GameRole"), run = run,
+        lunge.roles[read(player, "UserId") or id(player)] = { role = attr(player, "GameRole"), run = run,
             active = active, at = now }
     end
     if now >= (lunge.nextMine or 0) then
@@ -561,27 +567,70 @@ local function updateReachCaches(c, now)
     end
 end
 local function cachedRunner(player)
-    local cached = lunge.roles and lunge.roles[id(player)]
-    return cached and cached.role == "Runner" and cached.active == true
+    local cached = lunge.roles and lunge.roles[read(player, "UserId") or id(player)]
+    return cached and cached.role == "Runner" and cached.active == true and tick() - cached.at < 1
 end
 local function targetRoot(player)
     local character = read(player, "Character")
+    local health = read(child(character, "Humanoid"), "Health")
+    if not finite(health) or health <= 0 then return end
     local root = child(character, "HumanoidRootPart")
     local pos = read(root, "Position")
     if vector(pos) then return root, pos end
 end
+local function lungeDirection(value)
+    local x, z = tonumber(read(value, "X") or read(value, "x")), tonumber(read(value, "Z") or read(value, "z"))
+    if not finite(x) or not finite(z) then return end
+    local length = math.sqrt(x * x + z * z)
+    if length > .01 then return Vector3.new(x / length, 0, z / length) end
+end
+local function clearLungePath(c, target, from, to)
+    if not lunge.ray then
+        local ok, params = pcall(function()
+            local p = RaycastParams.new()
+            p.FilterType = Enum.RaycastFilterType.Exclude
+            p.RespectCanCollide = true
+            p.IgnoreWater = true
+            return p
+        end)
+        if not ok then return false end
+        lunge.ray = params
+    end
+    local dx, dz, distance = dotDelta(from, to)
+    if distance < .01 then return true end
+    local ok, clear = pcall(function()
+        lunge.ray.FilterDescendantsInstances = { c, read(target.player, "Character") }
+        for _, side in ipairs({ 0, -.9, .9 }) do
+            local origin = Vector3.new(from.X - dz / distance * side, from.Y, from.Z + dx / distance * side)
+            if world:Raycast(origin, Vector3.new(dx, to.Y - from.Y, dz), lunge.ray) then return false end
+        end
+        return true
+    end)
+    return ok and clear == true
+end
+local function lungeAim(root, pos, horizon)
+    local velocity = read(root, "AssemblyLinearVelocity")
+    if not vector(velocity) or horizontal(velocity) > 90 then return pos end
+    local lead = math.min(horizon, .18)
+    return Vector3.new(pos.X + velocity.X * lead, pos.Y, pos.Z + velocity.Z * lead)
+end
 local function reachTarget(root)
     local here = read(root, "Position")
-    if not vector(here) then return end
+    local forward = lungeDirection(read(read(root, "CFrame"), "LookVector"))
+    if not vector(here) or not forward then return end
     local best, bestDistance
     for _, player in ipairs(lunge.players or getPlayers()) do
-        if player ~= me and cachedRunner(player) then
+        if (read(player, "UserId") or id(player)) ~= (read(me, "UserId") or id(me)) and cachedRunner(player) then
             local target, pos = targetRoot(player)
-            if target and not inSafeZone(pos) then
-                local _, _, distance = dotDelta(here, pos)
-                if distance <= lunge.extra + 6 and (not bestDistance or distance < bestDistance) then
-                    best = { player = player, root = target, name = playerName(player) }
-                    bestDistance = distance
+            if target and math.abs(pos.Y - here.Y) <= 4 and not inSafeZone(pos) then
+                local dx, dz, distance = dotDelta(here, pos)
+                if distance > .01 and distance <= lunge.extra + 6
+                    and (dx * forward.X + dz * forward.Z) / distance >= .258819
+                    and (not bestDistance or distance < bestDistance) then
+                    local candidate = { player = player, root = target, name = playerName(player) }
+                    if clearLungePath(read(me, "Character"), candidate, here, pos) then
+                        best, bestDistance = candidate, distance
+                    end
                 end
             end
         end
@@ -591,53 +640,106 @@ end
 local function validLungeTarget(target)
     if not target or not cachedRunner(target.player) then return false end
     local root, pos = targetRoot(target.player)
+    if not root or id(root) ~= target.rootId then return false end
     target.root = root
-    return root and not inSafeZone(pos)
+    return not inSafeZone(pos)
 end
 local function lungeStep(c, now)
-    if not lunge.enabled then lunge.active, lunge.status = nil, "Off"; return end
-    updateReachCaches(c, now)
-    if lunge.myRole ~= "Catcher" or not lunge.myActive then
-        lunge.active, lunge.status = nil, "Waiting: be an active Catcher"; return
-    end
     local root = child(c, "HumanoidRootPart")
     local motion = child(root, "LocalTackleVelocity")
+    if not motion or lunge.seenRoot ~= id(root) then lunge.seenMotion = nil end
+    lunge.seenRoot = id(root)
+    if not lunge.enabled then
+        lunge.seenMotion = id(motion)
+        lunge.active, lunge.lock, lunge.status = nil, nil, "Off"; return
+    end
+    updateReachCaches(c, now)
+    if lunge.myRole ~= "Catcher" or not lunge.myActive then
+        lunge.seenMotion = id(motion)
+        lunge.active, lunge.lock, lunge.status = nil, nil, "Waiting: be an active Catcher"; return
+    end
+    local p = read(root, "Position")
+    local health = read(child(c, "Humanoid"), "Health")
+    if not vector(p) or not finite(health) or health <= 0 then
+        lunge.active, lunge.lock, lunge.status = nil, nil, "Waiting for living character"; return
+    end
+    if lunge.active and (not motion or lunge.active.rootId ~= id(root)) then
+        lunge.last = lunge.active
+        lunge.active = nil
+    end
     if not lunge.active and not motion then
+        if now < (lunge.nextAim or 0) then return end
+        lunge.nextAim = now + .1
         local target, distance = reachTarget(root)
-        lunge.status = target and string.format("Locked on: %s (%.1f studs)", target.name, distance) or "No runner in range"
-        return
-    end
-    if motion and (not lunge.active or lunge.active.motion ~= motion) then
-        local duration = attr(c, "TackleDuration")
-        if not (finite(duration) and duration >= .1 and duration <= 1) then duration = .32 end
-        local target = reachTarget(root)
-        lunge.active = { motion = motion, started = now, last = now, moved = 0, duration = duration,
-            target = target, name = target and target.name }
-    end
-    local active = lunge.active
-    if active and motion == active.motion and now - active.started <= active.duration then
-        if validLungeTarget(active.target) then
-            local dt = now - active.last
-            active.last = now
-            local p, tp = read(root, "Position"), read(active.target.root, "Position")
-            if vector(p) and vector(tp) then
-                local dx, dz, distance = dotDelta(p, tp)
-                if distance > 2 then
-                    local step = math.min(lunge.extra * dt / active.duration, 2.5, lunge.extra - active.moved, distance - 2)
-                    if step > .05 and pcall(function()
-                        root.Position = Vector3.new(p.X + dx / distance * step, p.Y, p.Z + dz / distance * step)
-                    end) then active.moved = active.moved + step end
+        if target then target.rootId = id(target.root) end
+        lunge.lock = target
+        lunge.status = target and string.format("Locked on: %s (%.1f studs)", target.name, distance) or "No clear runner ahead"
+        if target then
+            local _, tp = targetRoot(target.player)
+            local aim = lungeAim(target.root, tp, distance / 60)
+            local dx, dz, gap = dotDelta(p, aim)
+            local facing = lungeDirection(read(read(root, "CFrame"), "LookVector"))
+            if gap > .01 and facing and (dx * facing.X + dz * facing.Z) / gap < .99939 then
+                if not pcall(function() root.CFrame = CFrame.lookAt(p, Vector3.new(aim.X, p.Y, aim.Z)) end) then
+                    lunge.status = "Facing write rejected"
                 end
             end
-            lunge.status = "Lunging at " .. active.target.name
-        else
-            active.last = now
-            lunge.status = "Lunging at " .. (active.name or "nobody")
         end
         return
     end
-    if active then lunge.status = string.format("Last lunge: +%.1f studs toward %s", active.moved, active.name or "nobody") end
-    lunge.active = nil
+    if motion and lunge.seenMotion ~= id(motion) then
+        lunge.seenMotion = id(motion)
+        local duration = attr(c, "TackleDuration")
+        if not (finite(duration) and duration >= .1 and duration <= 1) then duration = .32 end
+        local target = lunge.lock
+        if not validLungeTarget(target) then target = reachTarget(root) end
+        if target then target.rootId = id(target.root) end
+        local forward = lungeDirection(attr(c, "TackleDirection"))
+            or lungeDirection(read(read(root, "CFrame"), "LookVector"))
+        lunge.active = { motionId = id(motion), rootId = id(root), started = now, last = now,
+            moved = 0, writes = 0, duration = duration, extra = lunge.extra, forward = forward,
+            target = target, name = target and target.name }
+    end
+    local active = lunge.active
+    -- The velocity survives into recovery: latch this motion until it disappears, never re-boost it.
+    if not active then lunge.status = "Waiting for next lunge"; return end
+    if active.done then return end
+    local elapsed, dt = now - active.started, now - active.last
+    active.last = now
+    if elapsed >= active.duration then
+        active.done = true
+        lunge.status = string.format("Last lunge: +%.1f studs toward %s", active.moved, active.name or "nobody")
+        return
+    end
+    if not validLungeTarget(active.target) or not active.forward then
+        active.done = true; lunge.status = "Lunge stopped: target unavailable"; return
+    end
+    local _, tp = targetRoot(active.target.player)
+    if math.abs(tp.Y - p.Y) > 4 then active.done = true; lunge.status = "Lunge stopped: height"; return end
+    local dx, dz, distance = dotDelta(p, tp)
+    local forward = dx * active.forward.X + dz * active.forward.Z
+    if forward < -.5 or distance > active.extra + 10 then
+        active.done = true; lunge.status = "Lunge stopped: target passed or out of range"; return
+    end
+    if forward >= 0 and forward <= 2.8 and math.abs(dx * active.forward.Z - dz * active.forward.X) <= 1.2 then
+        lunge.status = "In tackle range: " .. active.target.name; return
+    end
+    if dt <= 0 or dt > .08 then return end
+    local aim = lungeAim(active.target.root, tp, math.min(distance / 60, active.duration - elapsed))
+    aim = Vector3.new(aim.X - active.forward.X * 2, p.Y, aim.Z - active.forward.Z * 2)
+    dx, dz, distance = dotDelta(p, aim)
+    local boost = math.min(active.extra * math.min(dt, .05) / (active.duration * .65),
+        2.5, active.extra - active.moved, distance)
+    if boost <= .01 then return end
+    local nextPos = Vector3.new(p.X + dx / distance * boost, p.Y, p.Z + dz / distance * boost)
+    if not clearLungePath(c, active.target, p, nextPos) then
+        active.done = true; lunge.status = "Lunge stopped: obstacle"; return
+    end
+    if not pcall(function() root.Position = nextPos end) then
+        active.done = true; lunge.status = "Lunge stopped: position write rejected"; return
+    end
+    active.moved, active.writes = active.moved + boost, active.writes + 1
+    lunge.status = "Lunging at " .. active.target.name
 end
 local function step()
     if not app.alive then return end
@@ -671,7 +773,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.25 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.26 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
