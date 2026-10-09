@@ -622,7 +622,7 @@ end
 local function cachedRunner(player, now)
     local cached = lunge.roles and lunge.roles[read(player, "UserId") or id(player)]
     now = now or tick()
-    return cached and cached.role == "Runner" and cached.active == true and now - (cached.at or 0) < 2
+    return cached and cached.role == "Runner" and cached.active == true and now - (cached.at or 0) < 6
 end
 local function targetRoot(player)
     local character = read(player, "Character")
@@ -675,8 +675,7 @@ local function reachTarget(root, sticky, now)
         local targetPart, pos = targetRoot(player)
         if not targetPart or math.abs(pos.Y - here.Y) > 4 or inSafeZone(pos) then return end
         local dx, dz, distance = dotDelta(here, pos)
-        if distance <= .01 or distance > lunge.extra + 7 then return end
-        if (dx * forward.X + dz * forward.Z) / distance < .258819 then return end
+        if distance <= .01 or distance > 30 then return end
         target.root, target.rootId, target.name = targetPart, id(targetPart), target.name or playerName(player)
         return target, distance
     end
@@ -849,7 +848,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.33 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.34 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
