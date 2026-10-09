@@ -189,7 +189,7 @@ roleSlider(runnerTab, "Runner", "Travel speed", 10, MAX_SPEED, 1, state.target, 
     function(v) state.target = v end)
 local dash = { infinite = false, longer = false, scale = 1.5, status = "Off", boost = "Off" }
 app.dashState = dash -- lets tools/valley_test.js inspect the shared tracker
-lunge = { enabled = false, auto = false, range = 4.5, status = "Off" }
+lunge = { enabled = false, auto = false, range = 9, status = "Off" }
 app.lunge = lunge
 local cooldownGroup = runnerTab:AddIsland({ Title = "Dash cooldown" })
 roleToggle(cooldownGroup, "Runner", "infinite", "Infinite dash (no cooldown)", "Dash again as soon as the dash ends", false,
@@ -206,6 +206,8 @@ roleToggle(lungeGroup, "Catcher", "lunge", "Lunge lock-on", "Faces the nearest r
     function(on) lunge.enabled = on end)
 roleToggle(lungeGroup, "Catcher", "autoTackle", "Auto tackle", "Presses E when a locked runner is in tackle range", false,
     function(on) lunge.auto = on; if not on then releaseAutoTackle() end end)
+roleSlider(lungeGroup, "Catcher", "Auto range", 4, 14, .5, lunge.range, " studs", function() return lunge.range end,
+    function(v) lunge.range = v end)
 liveLabel(lungeGroup, "Lunge status", function() return lunge.status end)
 
 local function clearRoleEffects()
@@ -783,7 +785,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.41 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.42 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
