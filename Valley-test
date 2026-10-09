@@ -479,10 +479,7 @@ local function movementStep(c, root, now)
     if child(root, "LocalTackleVelocity") then
         pendingVelocity = nil; movementStatus = "Paused: tackle lunge"; return
     end
-    if type(isrbxactive) == "function" then
-        local active, focused = pcall(isrbxactive)
-        if not active or not focused then movementStatus = "Paused: Roblox not focused"; return end
-    end
+    -- No isrbxactive() gate: in Matcha it reports false even while Roblox is focused (seen live 2026-10-09).
     local humanoid = child(c, "Humanoid")
     local health = read(humanoid, "Health")
     if not finite(health) or health <= 0 then movementStatus = "Paused: no living character"; return end
@@ -710,14 +707,7 @@ local function lungeStep(c, now)
     if not vector(p) or not finite(health) or health <= 0 then
         lunge.lock, lunge.status = nil, "Waiting for living character"; return
     end
-    local focused = true
-    if type(isrbxactive) == "function" then
-        local ok, active = pcall(isrbxactive)
-        focused = ok and active == true
-        if not focused then
-            lunge.lock, lunge.status = nil, "Paused: Roblox not focused"; return
-        end
-    end
+    -- No isrbxactive() gate: it reports false even while Roblox is focused.
     if motion then
         lunge.seenMotion = motionId
         local name = lunge.lock and lunge.lock.name
@@ -793,7 +783,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.40 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.41 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
