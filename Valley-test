@@ -744,7 +744,7 @@ local function lungeStep(c, now)
     -- The velocity survives into recovery: latch this motion until it disappears, never re-boost it.
     if not active then lunge.status = "Waiting for next lunge"; return end
     if active.done then return end
-    -- ponytail: pursuit can outlive the native server hit window; reaching a runner does not guarantee a catch.
+    -- shortcut: pursuit can outlive the server hit window; add catch confirmation if server verdicts become available.
     local target, tp = validLungeTarget(active.target)
     if not target or not active.forward then
         active.done = true; lunge.status = "Lunge stopped: target unavailable"; return
@@ -755,7 +755,7 @@ local function lungeStep(c, now)
     if math.abs(tp.Y - p.Y) > 4 then active.done = true; lunge.status = "Lunge stopped: height"; return end
     local dx, dz, distance = dotDelta(p, tp)
     local forward = dx * active.forward.X + dz * active.forward.Z
-    if distance <= 1.25 and forward >= -.2 then
+    if distance * distance + (tp.Y - p.Y) ^ 2 <= 1.25 ^ 2 and forward >= -.2 then
         active.done = true; active.reached = true
         lunge.status = "Reached: " .. active.target.name; return
     end
@@ -817,7 +817,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.27 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.28 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
