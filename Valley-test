@@ -734,6 +734,17 @@ local function lungeStep(c, now)
     if not vector(p) or not finite(health) or health <= 0 then
         lunge.active, lunge.lock, lunge.status = nil, nil, "Waiting for living character"; return
     end
+    if lunge.active and not motion and not lunge.active.done and lunge.active.rootId == id(root) then
+        local _, tp = validLungeTarget(lunge.active.target)
+        if tp and math.abs(tp.Y - p.Y) <= 4 then
+            local _, _, gap = dotDelta(p, tp)
+            if gap <= lunge.active.extra + 2 and clearLungePath(c, lunge.active.target, p, tp) then
+                pcall(function() root.Position = Vector3.new(tp.X, p.Y, tp.Z) end)
+                lunge.status = "Ended on: " .. lunge.active.target.name
+            end
+        end
+        lunge.active.done = true
+    end
     if lunge.active and (lunge.active.rootId ~= id(root) or not motion and lunge.active.done) then
         lunge.last = lunge.active
         lunge.active = nil
@@ -796,9 +807,18 @@ local function lungeStep(c, now)
     local active = lunge.active
     -- The velocity survives into recovery: latch this motion until it disappears, never re-boost it.
     if not active then lunge.status = "Waiting for next lunge"; return end
-    if active.done then return end
-    -- shortcut: pursuit can outlive the server hit window; add catch confirmation if server verdicts become available.
+    if active.done and not active.reached then return end
     local target, tp = validLungeTarget(active.target)
+    if active.reached then
+        if not target or not motion or now - active.last < .025 then return end
+        active.last = now
+        pcall(function() root.Position = Vector3.new(tp.X, p.Y, tp.Z) end)
+        if not active.stopped then
+            active.stopped = true
+            pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+        end
+        return
+    end
     if not target or not active.forward then
         active.done = true; lunge.status = "Lunge stopped: target unavailable"; return
     end
@@ -820,7 +840,7 @@ local function lungeStep(c, now)
     local velocity = read(root, "AssemblyLinearVelocity")
     local nativeSpeed = motion and vector(velocity) and math.min(horizontal(velocity), 90) or 0
     local aim = lungeAim(active.target.root, tp, p, speed + nativeSpeed, 1, .18)
-    aim = Vector3.new(aim.X - active.forward.X * .75, p.Y, aim.Z - active.forward.Z * .75)
+    aim = Vector3.new(aim.X, p.Y, aim.Z)
     lunge.aimPoint = aim
     dx, dz, distance = dotDelta(p, aim)
     local boost = math.min(speed * dt, 2.5, distance)
@@ -871,7 +891,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.31 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.32 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
