@@ -77,7 +77,7 @@ rawset(_G, "ValleyJDUI", app)
 local state = { speed = false, target = 36 }
 local controls, liveLabels = {}, {}
 local roleToggles = { Catcher = {}, Runner = {} }
-local activeRole, roleRunState, nextRoleCheck, roleReady = nil, nil, 0, false
+local activeRole, lastGameRole, roleRunState, nextRoleCheck, roleReady = nil, nil, nil, 0, false
 local connection, characterId
 local pendingVelocity
 local MAX_SPEED = 45
@@ -211,6 +211,13 @@ roleSlider(lungeGroup, "Catcher", "Extra lunge", 1, 8, .5, lunge.extra, " studs"
     function(v) lunge.extra = v end)
 liveLabel(lungeGroup, "Lunge status", function() return lunge.status end)
 
+local function clearRoleEffects()
+    pendingVelocity, movementStatus = nil, "Off"
+    dash.track, dash.motion, dash.status, dash.boost = nil, nil, "Off", "Off"
+    dash.failedCount, dash.nextScan, dash.failures, dash.lastCount = nil, 0, 0, nil
+    if lunge.active then lunge.active.done = true end
+    lunge.active, lunge.lock, lunge.status, lunge.seenMotion = nil, nil, "Off", nil
+end
 local function resetRoleFeatures()
     for _, role in ipairs({ "Catcher", "Runner" }) do
         for _, entry in ipairs(roleToggles[role]) do
@@ -218,23 +225,27 @@ local function resetRoleFeatures()
             entry.apply(false)
         end
     end
-    pendingVelocity, movementStatus = nil, "Off"
-    dash.track, dash.motion, dash.status, dash.boost = nil, nil, "Off", "Off"
-    dash.failedCount, dash.nextScan, dash.failures, dash.lastCount = nil, 0, 0, nil
-    if lunge.active then lunge.active.done = true end
-    lunge.active, lunge.lock, lunge.status, lunge.seenMotion = nil, nil, "Off", nil
+    clearRoleEffects()
 end
 local function syncRole(now, force)
     if not force and now < nextRoleCheck then return end
     nextRoleCheck = now + .1
     local run = attr(me, "RunState")
-    local role = run == "Active" and attr(me, "GameRole") or nil
-    if role ~= "Catcher" and role ~= "Runner" then role = nil end
-    if not force and role == activeRole and run == roleRunState then return end
+    local gameRole = attr(me, "GameRole")
+    if gameRole ~= "Catcher" and gameRole ~= "Runner" then gameRole = nil end
+    local roleChanged = gameRole ~= nil and gameRole ~= lastGameRole
+    local role = run == "Active" and gameRole or nil
+    local stateChanged = run ~= roleRunState or role ~= activeRole
+    if not force and not roleChanged and not stateChanged then return end
+    if force or roleChanged then
+        if gameRole then lastGameRole = gameRole end
+        resetRoleFeatures()
+    else
+        clearRoleEffects()
+    end
     activeRole, roleRunState, app.role = role, run, role
-    resetRoleFeatures()
     roleReady = true
-    local selectedTab = roleTabs[role] or ui.Settings
+    local selectedTab = roleTabs[activeRole or lastGameRole] or ui.Settings
     selectedTab:Select()
 end
 ui:SetConfig("huss_valley_config")
@@ -860,7 +871,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.30 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.31 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
