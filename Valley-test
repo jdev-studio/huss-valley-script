@@ -213,8 +213,8 @@ liveLabel(lungeGroup, "Lunge status", function() return lunge.status end)
 
 local function clearRoleEffects()
     pendingVelocity, movementStatus = nil, "Off"
-    dash.track, dash.motion, dash.status, dash.boost = nil, nil, "Off", "Off"
-    dash.failedCount, dash.nextScan, dash.failures, dash.lastCount = nil, 0, 0, nil
+    dash.motion, dash.status = nil, "Off" -- keep dash.track: it stays valid until the character changes
+    dash.failedCount, dash.nextScan = nil, 0
     if lunge.active then lunge.active.done = true end
     lunge.active, lunge.lock, lunge.status, lunge.seenMotion = nil, nil, "Off", nil
 end
@@ -398,7 +398,9 @@ local function loseDash(reason)
 end
 local function dashStep(c, now)
     dash.motion = nil
-    if activeRole ~= "Runner" or not dash.infinite and not dash.longer then dash.status = "Off"; return end
+    -- A waiting Runner still finds the table, so both features work from the first dash of the round.
+    local runner = activeRole == "Runner"
+    if (not runner and lastGameRole ~= "Runner") or not dash.infinite and not dash.longer then dash.status = "Off"; return end
     if type(getgc) ~= "function" or type(memory_read) ~= "function" or type(memory_write) ~= "function" then
         dash.status = "Enable unsafe Lua execution in Matcha"; return
     end
@@ -412,7 +414,7 @@ local function dashStep(c, now)
         if now < (dash.nextScan or 0) then return end
         dash.nextScan = now + .5
         local count = attr(c, "DashCount")
-        if not finite(count) or count <= 0 then dash.status = "Dash once to find the dash state"; return end
+        if not finite(count) or count < 0 then dash.status = "Waiting for dash state"; return end
         if count == dash.failedCount then return end -- one scan per dash, never a scan loop
         local began = tick()
         local reason, fresh
@@ -420,7 +422,7 @@ local function dashStep(c, now)
         if not track then
             -- Back off after repeated misses so a hard-to-find table never costs a freeze on every dash.
             dash.failures = dash.failures + 1
-            dash.failedCount, dash.nextScan = finite(fresh) and fresh or count, tick() + math.min(30, 2 ^ dash.failures)
+            dash.failedCount, dash.nextScan = finite(fresh) and fresh or count, tick() + math.min(10, dash.failures)
             dash.status = reason .. "; dash again to retry"
             log(string.format("Dash state: %s (%.2fs)", reason, tick() - began)); return
         end
@@ -450,8 +452,11 @@ local function dashStep(c, now)
         track.mismatch = finite(published) and published ~= count and (track.mismatch or 0) + 1 or 0
         if track.mismatch >= 2 then loseDash("Dash state stopped matching the game"); return end
     end
+    if not runner then dash.status = "Ready for the round"; return end
     if count ~= dash.lastCount then
         dash.lastCount = count
+        -- Boost fields appear after the first dash, often without a rehash: re-walk once to pick them up.
+        if nodes.noBoost then nodes = scanNodes(track.base, track.size) or nodes; track.nodes = nodes end
         if dash.longer then extendDash(track, count) end
     end
     if dash.infinite then
@@ -851,7 +856,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.35 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.36 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
