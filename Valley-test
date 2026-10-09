@@ -133,6 +133,11 @@ end
 local function notify(title, message)
     ui:Notify({ Title = title, Content = message, Duration = 4 })
 end
+local lunge
+local function releaseAutoTackle()
+    if lunge and lunge.pressedAt and type(keyrelease) == "function" then pcall(keyrelease, 0x45) end
+    if lunge then lunge.pressedAt = nil end
+end
 local function disable(feature, reason)
     state[feature] = false
     if controls[feature] then controls[feature]:SetValue(false, true) end
@@ -141,6 +146,7 @@ local function disable(feature, reason)
 end
 function app.stop()
     if not app.alive then return end
+    releaseAutoTackle()
     app.alive = false
     if connection then connection:Disconnect() end
     if ui.Alive then ui:Destroy() end
@@ -183,7 +189,7 @@ roleSlider(runnerTab, "Runner", "Travel speed", 10, MAX_SPEED, 1, state.target, 
     function(v) state.target = v end)
 local dash = { infinite = false, longer = false, scale = 1.5, status = "Off", boost = "Off" }
 app.dashState = dash -- lets tools/valley_test.js inspect the shared tracker
-local lunge = { enabled = false, extra = 5, overshoot = 2, status = "Off" }
+lunge = { enabled = false, auto = false, range = 4.5, status = "Off" }
 app.lunge = lunge
 local cooldownGroup = runnerTab:AddIsland({ Title = "Dash cooldown" })
 roleToggle(cooldownGroup, "Runner", "infinite", "Infinite dash (no cooldown)", "Dash again as soon as the dash ends", false,
@@ -196,18 +202,18 @@ roleSlider(distanceGroup, "Runner", "Dash distance", 1.1, 3, .1, dash.scale, "x"
     function(v) dash.scale = v end)
 liveLabel(distanceGroup, "Distance status", function() return dash.longer and (dash.track and dash.boost or dash.status) or "Off" end)
 local lungeGroup = catcherTab:AddIsland({ Title = "Lunge lock-on" })
-roleToggle(lungeGroup, "Catcher", "lunge", "Lunge lock-on", "Holds a runner in aim; Space/E follows until contact", false,
+roleToggle(lungeGroup, "Catcher", "lunge", "Lunge lock-on", "Faces the nearest runner", false,
     function(on) lunge.enabled = on end)
-roleSlider(lungeGroup, "Catcher", "Extra lunge", 1, 8, .5, lunge.extra, " studs", function() return lunge.extra end,
-    function(v) lunge.extra = v end)
+roleToggle(lungeGroup, "Catcher", "autoTackle", "Auto tackle", "Presses E when a locked runner is in tackle range", false,
+    function(on) lunge.auto = on; if not on then releaseAutoTackle() end end)
 liveLabel(lungeGroup, "Lunge status", function() return lunge.status end)
 
 local function clearRoleEffects()
     pendingVelocity, movementStatus = nil, "Off"
     dash.motion, dash.status = nil, "Off" -- keep dash.track: it stays valid until the character changes
     dash.failedCount, dash.nextScan = nil, 0
-    if lunge.active then lunge.active.done = true end
-    lunge.active, lunge.lock, lunge.status, lunge.seenMotion = nil, nil, "Off", nil
+    releaseAutoTackle()
+    lunge.lock, lunge.status, lunge.seenMotion = nil, "Off", nil
 end
 local function syncRole(now, force)
     if not force and now < nextRoleCheck then return end
@@ -470,7 +476,7 @@ local function movementDirection(humanoid)
 end
 local function movementStep(c, root, now)
     if activeRole ~= "Runner" or not state.speed then movementStatus = "Off"; return end
-    if lunge.active or child(root, "LocalTackleVelocity") then
+    if child(root, "LocalTackleVelocity") then
         pendingVelocity = nil; movementStatus = "Paused: tackle lunge"; return
     end
     if type(isrbxactive) == "function" then
@@ -685,122 +691,74 @@ local function lungeStep(c, now)
     local rootId = id(root)
     local motion = child(root, "LocalTackleVelocity")
     local motionId = id(motion)
+    if lunge.pressedAt and now - lunge.pressedAt >= .06 then releaseAutoTackle() end
     if not motion or lunge.seenRoot ~= rootId then lunge.seenMotion = nil end
     lunge.seenRoot = rootId
     if activeRole ~= "Catcher" then
+        releaseAutoTackle()
         lunge.seenMotion = motionId
-        lunge.active, lunge.lock, lunge.status = nil, nil, "Off"; return
+        lunge.lock, lunge.status = nil, "Off"; return
     end
     if not lunge.enabled then
+        releaseAutoTackle()
         lunge.seenMotion = motionId
-        lunge.active, lunge.lock, lunge.status = nil, nil, "Off"; return
+        lunge.lock, lunge.status = nil, "Off"; return
     end
-    local starting = motion and lunge.seenMotion ~= motionId
-    if not lunge.active and not starting then updateReachCaches(c, now) end
+    if not motion then updateReachCaches(c, now) end
     local p = read(root, "Position")
     local health = read(child(c, "Humanoid"), "Health")
     if not vector(p) or not finite(health) or health <= 0 then
-        lunge.active, lunge.lock, lunge.status = nil, nil, "Waiting for living character"; return
+        lunge.lock, lunge.status = nil, "Waiting for living character"; return
     end
+    local focused = true
     if type(isrbxactive) == "function" then
-        local ok, focused = pcall(isrbxactive)
-        if not ok or not focused then
+        local ok, active = pcall(isrbxactive)
+        focused = ok and active == true
+        if not focused then
             lunge.lock, lunge.status = nil, "Paused: Roblox not focused"; return
         end
     end
-    local function goalPoint(target, pos, horizon)
-        local aim = lungeAim(target.root, pos, p, 160, 0, horizon)
-        aim = Vector3.new(aim.X, p.Y, aim.Z)
-        local dx, dz, distance = dotDelta(p, aim)
-        if distance <= .01 then return aim, distance end
-        return Vector3.new(aim.X + dx / distance * (lunge.overshoot or 2), p.Y,
-            aim.Z + dz / distance * (lunge.overshoot or 2)), distance
-    end
-    local active = lunge.active
-    if active and (active.rootId ~= rootId or not motion or motionId ~= active.motionId
-        or now - active.started > active.duration + .05) then
-        local target, tp = validLungeTarget(active.target, now)
-        if target and math.abs(tp.Y - p.Y) <= 4 then
-            local goal = goalPoint(active.target, tp, .12)
-            local _, _, gap = dotDelta(p, goal)
-            -- No end snap: a one-frame jump breaks the same server speed check.
-        end
-        lunge.status = active.target and string.format("Last lunge +%.1f studs at %s", active.moved or 0,
-            active.name or active.target.name) or "Lunging (no target)"
-        lunge.active = nil
-        return
-    end
-    if starting then
-        lunge.seenMotion = motionId
-        local duration = attr(c, "TackleDuration")
-        if not (finite(duration) and duration >= .1 and duration <= 1) then duration = .32 end
-        local target, tp = lunge.lock, nil
-        local targetRootPart
-        targetRootPart, tp = validLungeTarget(target, now)
-        if not targetRootPart or math.abs(tp.Y - p.Y) > 4 then
-            target = reachTarget(root, nil, now)
-            targetRootPart, tp = validLungeTarget(target, now)
-        end
-        local distance = 0
-        if targetRootPart and tp then _, _, distance = dotDelta(p, tp) else target = nil end
-        lunge.active = { motionId = motionId, rootId = rootId, started = now, last = now,
-            duration = duration, moved = 0, extra = lunge.extra, distance = distance,
-            target = target, name = target and target.name }
-        if not target then lunge.status = "Lunging (no target)"; return end
-    end
-    active = lunge.active
-    if active then
-        if not active.target then lunge.status = "Lunging (no target)"; return end
-        local target, tp = validLungeTarget(active.target, now)
-        if not target or math.abs(tp.Y - p.Y) > 4 then
-            lunge.active = nil
-            lunge.status = "Lunge stopped: target unavailable"; return
-        end
-        local dt = now - (active.last or now)
-        active.last = now
-        if dt < 0 or dt > .1 then dt = 1 / 60 end
-        local goal = goalPoint(active.target, tp, .12)
-        local dx, dz, distance = dotDelta(p, goal)
-        local remaining = active.extra + active.distance - active.moved
-        -- Pushing too fast makes the server cancel the tackle (seen live: lunge cut to 0.40 s), so
-        -- native lunge speed + push stays under ~130 studs/s.
-        local velocity = read(root, "AssemblyLinearVelocity")
-        local native = vector(velocity) and horizontal(velocity) or 0
-        local step = math.min(2.2, math.max(0, 130 - native) * dt, remaining, distance)
-        if step > .03 and distance > .01 then
-            local nextPos = Vector3.new(p.X + dx / distance * step, p.Y, p.Z + dz / distance * step)
-            if not pcall(function() root.Position = nextPos end) then
-                lunge.active = nil
-                lunge.status = "Lunge stopped: position write rejected"; return
-            end
-            active.moved = active.moved + step
-        end
-        lunge.status = "Lunging at " .. active.target.name
-        return
-    end
     if motion then
-        lunge.status = "Waiting for next lunge"; return
+        lunge.seenMotion = motionId
+        local name = lunge.lock and lunge.lock.name
+        lunge.status = name and ("Tackling " .. name) or "Tackling"
+        return
     end
-    if now < (lunge.nextAim or 0) then return end
-    lunge.nextAim = now + .1
-    local target, distance = reachTarget(root, lunge.lock, now)
-    lunge.lock = target
-    lunge.status = target and string.format("Locked on: %s (%.1f studs)", target.name, distance) or "No runner in range"
-    if not target then return end
-    local _, tp = targetRoot(target.player)
-    if not tp then return end
-    local aim = lungeAim(target.root, tp, p, 60 + 45 + lunge.extra / (.32 * .65), 4, .18)
-    lunge.aimPoint = aim
-    if now >= (lunge.nextFace or 0) then
-        local facing = lungeDirection(read(read(root, "CFrame"), "LookVector"))
-        local dx, dz, gap = dotDelta(p, aim)
-        if facing and gap > .01 and (dx * facing.X + dz * facing.Z) / gap < .978148 then
-            lunge.nextFace = now + .2
-            if not pcall(function() root.CFrame = CFrame.lookAt(p, Vector3.new(aim.X, p.Y, aim.Z)) end) then
-                lunge.status = "Facing write rejected"
+    if now >= (lunge.nextAim or 0) then
+        lunge.nextAim = now + .1
+        local target, distance = reachTarget(root, lunge.lock, now)
+        lunge.lock = target
+        lunge.status = target and string.format("Locked on: %s (%.1f studs)", target.name, distance) or "No runner in range"
+        if target then
+            local _, tp = targetRoot(target.player)
+            if tp then
+                local aim = lungeAim(target.root, tp, p, 105, 4, .18)
+                lunge.aimPoint = aim
+                if now >= (lunge.nextFace or 0) then
+                    local facing = lungeDirection(read(read(root, "CFrame"), "LookVector"))
+                    local dx, dz, gap = dotDelta(p, aim)
+                    if facing and gap > .01 and (dx * facing.X + dz * facing.Z) / gap < .978148 then
+                        lunge.nextFace = now + .2
+                        if not pcall(function() root.CFrame = CFrame.lookAt(p, Vector3.new(aim.X, p.Y, aim.Z)) end) then
+                            lunge.status = "Facing write rejected"
+                        end
+                    end
+                end
             end
         end
     end
+    if not lunge.auto then return end
+    if type(keypress) ~= "function" then lunge.status = "Auto tackle needs keypress()"; return end
+    local target, tp = validLungeTarget(lunge.lock, now)
+    if not target or not tp or math.abs(tp.Y - p.Y) > 4 then return end
+    local _, _, distance = dotDelta(p, tp)
+    if distance > lunge.range or now < (lunge.nextPress or 0) then return end
+    pcall(function() root.CFrame = CFrame.lookAt(p, Vector3.new(tp.X, p.Y, tp.Z)) end)
+    keypress(0x45)
+    lunge.pressedAt = now
+    lunge.nextPress = now + 1
+    lunge.status = string.format("Auto tackle on %s (%.1f studs)", target.name, distance)
+    log(lunge.status)
 end
 local function step()
     if not app.alive then return end
@@ -835,7 +793,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.39 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.40 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
