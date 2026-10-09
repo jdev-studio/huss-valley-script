@@ -694,7 +694,7 @@ local function lungeStep(c, now)
     end
     if not lunge.active and not motion then
         if now < (lunge.nextAim or 0) then return end
-        lunge.nextAim = now + .05
+        lunge.nextAim = now + .025
         local target, distance = lunge.lock
         local lockedRoot, tp = validLungeTarget(target)
         if lockedRoot then
@@ -817,7 +817,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.28 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.29 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
