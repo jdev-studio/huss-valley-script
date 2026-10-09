@@ -740,7 +740,7 @@ local function lungeStep(c, now)
         if target and math.abs(tp.Y - p.Y) <= 4 then
             local goal = goalPoint(active.target, tp, .12)
             local _, _, gap = dotDelta(p, goal)
-            if gap <= 3 then pcall(function() root.Position = Vector3.new(goal.X, p.Y, goal.Z) end) end
+            -- No end snap: a one-frame jump would break the server's speed check.
         end
         lunge.status = active.target and string.format("Last lunge +%.1f studs at %s", active.moved or 0,
             active.name or active.target.name) or "Lunging (no target)"
@@ -779,7 +779,10 @@ local function lungeStep(c, now)
         local goal = goalPoint(active.target, tp, .12)
         local dx, dz, distance = dotDelta(p, goal)
         local remaining = active.extra + active.distance - active.moved
-        local step = math.min(2.2, 160 * dt, remaining, distance)
+        -- The server drops position samples faster than ~150 studs/s, so native lunge + push stays under 130.
+        local velocity = read(root, "AssemblyLinearVelocity")
+        local native = vector(velocity) and horizontal(velocity) or 0
+        local step = math.min(2.2, math.max(0, 130 - native) * dt, remaining, distance)
         if step > .03 and distance > .01 then
             local nextPos = Vector3.new(p.X + dx / distance * step, p.Y, p.Z + dz / distance * step)
             if not pcall(function() root.Position = nextPos end) then
@@ -848,7 +851,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.34 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.35 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
