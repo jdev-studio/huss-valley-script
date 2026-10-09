@@ -166,13 +166,7 @@ end
 local function roleToggle(tab, role, feature, title, description, default, apply)
     local c
     c = tab:AddToggle({ Title = title, Description = description, Default = default,
-        Callback = function(on)
-            if on and (not roleReady or activeRole ~= role) then
-                on = false
-                if c then c:SetValue(false, true) end
-            end
-            apply(on)
-        end })
+        Callback = function(on) apply(on) end }) -- stays on across roles; each feature only acts in its own role
     controls[feature] = c
     roleToggles[role][#roleToggles[role] + 1] = { control = c, apply = apply }
     return c
@@ -180,10 +174,7 @@ end
 local function roleSlider(tab, role, title, lo, hi, step, default, suffix, value, apply)
     local c
     c = tab:AddSlider({ Title = title, Min = lo, Max = hi, Step = step, Default = default, Suffix = suffix,
-        Callback = function(v)
-            if roleReady and activeRole ~= role then c:SetValue(value(), true); return end
-            apply(v)
-        end })
+        Callback = function(v) apply(v) end })
     return c
 end
 roleToggle(runnerTab, "Runner", "speed", "Speed tuning", "Uses movement input; preserves falling/jumping velocity", false,
@@ -218,15 +209,6 @@ local function clearRoleEffects()
     if lunge.active then lunge.active.done = true end
     lunge.active, lunge.lock, lunge.status, lunge.seenMotion = nil, nil, "Off", nil
 end
-local function resetRoleFeatures()
-    for _, role in ipairs({ "Catcher", "Runner" }) do
-        for _, entry in ipairs(roleToggles[role]) do
-            entry.control:SetValue(false, true)
-            entry.apply(false)
-        end
-    end
-    clearRoleEffects()
-end
 local function syncRole(now, force)
     if not force and now < nextRoleCheck then return end
     nextRoleCheck = now + .1
@@ -237,12 +219,8 @@ local function syncRole(now, force)
     local role = run == "Active" and gameRole or nil
     local stateChanged = run ~= roleRunState or role ~= activeRole
     if not force and not roleChanged and not stateChanged then return end
-    if force or roleChanged then
-        if gameRole then lastGameRole = gameRole end
-        resetRoleFeatures()
-    else
-        clearRoleEffects()
-    end
+    if gameRole then lastGameRole = gameRole end
+    clearRoleEffects()
     activeRole, roleRunState, app.role = role, run, role
     roleReady = true
     local selectedTab = roleTabs[activeRole or lastGameRole] or ui.Settings
@@ -857,7 +835,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.38 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.39 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
