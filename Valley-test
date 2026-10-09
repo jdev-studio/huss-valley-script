@@ -76,6 +76,8 @@ local app = { alive = true, ui = ui }
 rawset(_G, "ValleyJDUI", app)
 local state = { speed = false, target = 36 }
 local controls, liveLabels = {}, {}
+local roleToggles = { Catcher = {}, Runner = {} }
+local activeRole, roleRunState, nextRoleCheck, roleReady = nil, nil, 0, false
 local connection, characterId
 local pendingVelocity
 local MAX_SPEED = 45
@@ -149,9 +151,10 @@ end
 
 ui.Title = "Huss Valley"
 ui:SetLayout("Compact")
-local movement = ui:AddTab({ Title = "Movement", Icon = "bolt" })
-local reachTab = ui:AddTab({ Title = "Hitbox", Icon = "spark" })
-ui.Tabs = { movement, reachTab, ui.Settings }
+local catcherTab = ui:AddTab({ Title = "Catcher", Icon = "spark" })
+local runnerTab = ui:AddTab({ Title = "Runner", Icon = "bolt" })
+local roleTabs = { Catcher = catcherTab, Runner = runnerTab }
+ui.Tabs = { catcherTab, runnerTab, ui.Settings }
 for i = #ui.Settings.Controls, 1, -1 do
     if ui.Settings.Controls[i].Title == "Test notification" then table.remove(ui.Settings.Controls, i) end
 end
@@ -160,47 +163,82 @@ local function liveLabel(tab, title, provider)
     liveLabels[#liveLabels + 1] = { control = control, provider = provider }
     return control
 end
-local function toggle(tab, title, feature, description)
-    local c = tab:AddToggle({ Title = title, Description = description, Default = state[feature],
+local function roleToggle(tab, role, feature, title, description, default, apply)
+    local c
+    c = tab:AddToggle({ Title = title, Description = description, Default = default,
         Callback = function(on)
-            state[feature] = on
-            if feature == "speed" then pendingVelocity = nil end
+            if on and (not roleReady or activeRole ~= role) then
+                on = false
+                if c then c:SetValue(false, true) end
+            end
+            apply(on)
         end })
     controls[feature] = c
+    roleToggles[role][#roleToggles[role] + 1] = { control = c, apply = apply }
     return c
 end
-local function slider(tab, title, feature, lo, hi, step, suffix)
-    local c = tab:AddSlider({ Title = title, Min = lo, Max = hi, Step = step, Default = state[feature], Suffix = suffix,
-        Callback = function(v) state[feature] = v end })
-    controls[feature] = c
+local function roleSlider(tab, role, title, lo, hi, step, default, suffix, value, apply)
+    local c
+    c = tab:AddSlider({ Title = title, Min = lo, Max = hi, Step = step, Default = default, Suffix = suffix,
+        Callback = function(v)
+            if roleReady and activeRole ~= role then c:SetValue(value(), true); return end
+            apply(v)
+        end })
     return c
 end
-toggle(movement, "Speed tuning", "speed", "Uses movement input; preserves falling/jumping velocity")
-slider(movement, "Travel speed", "target", 10, MAX_SPEED, 1, " studs/s")
+roleToggle(runnerTab, "Runner", "speed", "Speed tuning", "Uses movement input; preserves falling/jumping velocity", false,
+    function(on) state.speed = on; pendingVelocity = nil end)
+roleSlider(runnerTab, "Runner", "Travel speed", 10, MAX_SPEED, 1, state.target, " studs/s", function() return state.target end,
+    function(v) state.target = v end)
 local dash = { infinite = false, longer = false, scale = 1.5, status = "Off", boost = "Off" }
 app.dashState = dash -- lets tools/valley_test.js inspect the shared tracker
 local lunge = { enabled = false, extra = 5, status = "Off" }
 app.lunge = lunge
-local cooldownGroup = movement:AddIsland({ Title = "Dash cooldown" })
-cooldownGroup:AddToggle({ Title = "Infinite dash (no cooldown)", Default = false,
-    Description = "Dash again as soon as the dash ends",
-    Callback = function(on) dash.infinite = on end })
+local cooldownGroup = runnerTab:AddIsland({ Title = "Dash cooldown" })
+roleToggle(cooldownGroup, "Runner", "infinite", "Infinite dash (no cooldown)", "Dash again as soon as the dash ends", false,
+    function(on) dash.infinite = on end)
 liveLabel(cooldownGroup, "Write status", function() return dash.infinite and dash.status or "Off" end)
-local distanceGroup = movement:AddIsland({ Title = "Dash distance" })
-distanceGroup:AddToggle({ Title = "Longer dash", Default = false, Description = "Each dash travels further",
-    Callback = function(on) dash.longer = on end })
-distanceGroup:AddSlider({ Title = "Dash distance", Min = 1.1, Max = 3, Step = .1, Default = dash.scale, Suffix = "x",
-    Callback = function(v) dash.scale = v end })
+local distanceGroup = runnerTab:AddIsland({ Title = "Dash distance" })
+roleToggle(distanceGroup, "Runner", "longer", "Longer dash", "Each dash travels further", false,
+    function(on) dash.longer = on end)
+roleSlider(distanceGroup, "Runner", "Dash distance", 1.1, 3, .1, dash.scale, "x", function() return dash.scale end,
+    function(v) dash.scale = v end)
 liveLabel(distanceGroup, "Distance status", function() return dash.longer and (dash.track and dash.boost or dash.status) or "Off" end)
-local lungeGroup = reachTab:AddIsland({ Title = "Lunge lock-on" })
-lungeGroup:AddToggle({ Title = "Lunge lock-on", Default = false,
-    Description = "Holds a runner in aim; Space/E follows until contact",
-    Callback = function(on) lunge.enabled = on end })
-lungeGroup:AddSlider({ Title = "Extra lunge", Min = 1, Max = 8, Step = .5, Default = lunge.extra, Suffix = " studs",
-    Callback = function(v) lunge.extra = v end })
+local lungeGroup = catcherTab:AddIsland({ Title = "Lunge lock-on" })
+roleToggle(lungeGroup, "Catcher", "lunge", "Lunge lock-on", "Holds a runner in aim; Space/E follows until contact", false,
+    function(on) lunge.enabled = on end)
+roleSlider(lungeGroup, "Catcher", "Extra lunge", 1, 8, .5, lunge.extra, " studs", function() return lunge.extra end,
+    function(v) lunge.extra = v end)
 liveLabel(lungeGroup, "Lunge status", function() return lunge.status end)
+
+local function resetRoleFeatures()
+    for _, role in ipairs({ "Catcher", "Runner" }) do
+        for _, entry in ipairs(roleToggles[role]) do
+            entry.control:SetValue(false, true)
+            entry.apply(false)
+        end
+    end
+    pendingVelocity, movementStatus = nil, "Off"
+    dash.track, dash.motion, dash.status, dash.boost = nil, nil, "Off", "Off"
+    dash.failedCount, dash.nextScan, dash.failures, dash.lastCount = nil, 0, 0, nil
+    if lunge.active then lunge.active.done = true end
+    lunge.active, lunge.lock, lunge.status, lunge.seenMotion = nil, nil, "Off", nil
+end
+local function syncRole(now, force)
+    if not force and now < nextRoleCheck then return end
+    nextRoleCheck = now + .1
+    local run = attr(me, "RunState")
+    local role = run == "Active" and attr(me, "GameRole") or nil
+    if role ~= "Catcher" and role ~= "Runner" then role = nil end
+    if not force and role == activeRole and run == roleRunState then return end
+    activeRole, roleRunState, app.role = role, run, role
+    resetRoleFeatures()
+    roleReady = true
+    local selectedTab = roleTabs[role] or ui.Settings
+    selectedTab:Select()
+end
 ui:SetConfig("huss_valley_config")
-movement:Select()
+syncRole(tick(), true)
 -- Both dash features share one view of the game's private movement table (MovementModel state).
 -- In Matcha a GetAttribute costs ~0.8ms but a memory_read ~0.002ms, so the per-frame path reads memory only.
 -- Luau node (32 bytes): value +0, value tag +12, key string +16, key tag (low 4 bits) and chain +28.
@@ -349,7 +387,7 @@ local function loseDash(reason)
 end
 local function dashStep(c, now)
     dash.motion = nil
-    if not dash.infinite and not dash.longer then dash.status = "Off"; return end
+    if activeRole ~= "Runner" or not dash.infinite and not dash.longer then dash.status = "Off"; return end
     if type(getgc) ~= "function" or type(memory_read) ~= "function" or type(memory_write) ~= "function" then
         dash.status = "Enable unsafe Lua execution in Matcha"; return
     end
@@ -437,7 +475,7 @@ local function movementDirection(humanoid)
         look.Z / lookLength * forward + right.Z / rightLength * side)
 end
 local function movementStep(c, root, now)
-    if not state.speed then movementStatus = "Off"; return end
+    if activeRole ~= "Runner" or not state.speed then movementStatus = "Off"; return end
     if lunge.active or child(root, "LocalTackleVelocity") then
         pendingVelocity = nil; movementStatus = "Paused: tackle lunge"; return
     end
@@ -667,6 +705,10 @@ local function lungeStep(c, now)
     local motion = child(root, "LocalTackleVelocity")
     if not motion or lunge.seenRoot ~= id(root) then lunge.seenMotion = nil end
     lunge.seenRoot = id(root)
+    if activeRole ~= "Catcher" then
+        lunge.seenMotion = id(motion)
+        lunge.active, lunge.lock, lunge.status = nil, nil, "Off"; return
+    end
     if not lunge.enabled then
         lunge.seenMotion = id(motion)
         lunge.active, lunge.lock, lunge.status = nil, nil, "Off"; return
@@ -790,6 +832,7 @@ local function step()
     if not ui.Alive then app.stop(); return end
     flushLog()
     local now = tick()
+    syncRole(now)
     local c = read(me, "Character")
     local root = child(c, "HumanoidRootPart")
     if id(c) ~= characterId then
@@ -817,7 +860,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.29 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.30 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
