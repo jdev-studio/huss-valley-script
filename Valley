@@ -240,45 +240,51 @@ local function scanNodes(base, size)
     return nodes
 end
 -- The table header keeps its address for the character's whole life; only its node array moves on rehash.
+-- Roblox reshuffles the header's fields between client builds (2026-10: size byte moved, node pointer +24 -> +40),
+-- so discovery finds the node pointer by what it points at and learns where the size byte sits next to it.
 local function headerNodes(header)
-    local at = header.address
-    if memoryValue("byte", at + header.typeOffset) ~= header.tag then return end
-    local power = memoryValue("byte", at + header.powerOffset)
-    if not finite(power) or power < 2 or power > 10
-        or memoryValue("byte", at + header.powerOffset + 1) ~= (2 ^ power - 1) % 256 then return end
-    local base = memoryValue("uintptr_t", at + header.nodeOffset)
+    local power = memoryValue("byte", header.powerAt)
+    if not finite(power) or power < 2 or power > 10 then return end
+    local base = memoryValue("uintptr_t", header.pointerAt)
     if validAddress(base) and base >= 65536 then return base, 2 ^ power end
+end
+-- Luau keeps the node mask (2^size - 1) a byte or two after the size byte; requiring it rules out stray bytes.
+local function sizeByteAt(address)
+    local power = memoryValue("byte", address)
+    if not finite(power) or power < 2 or power > 10 then return end
+    for gap = 1, 3 do
+        if memoryValue("byte", address + gap) == (2 ^ power - 1) % 256 then return power end
+    end
 end
 local function discoverDash(c, count)
     local success, entries = pcall(getgc, { "travelHistory" })
     if not success or type(entries) ~= "table" then return nil, "Memory scan unavailable" end
-    -- Layout measured live 2026-10-06; the full sweep only runs if Roblox reshuffles the table struct.
-    local layouts = { dash.layout or { typeOffset = 1, powerOffset = 4, nodeOffset = 24 } }
-    local reach = dash.layout and (dash.failures or 0) > 0 and 16384 or 1024 -- wide search only with one known layout
-    if dash.layout == nil and dash.swept then
-        for typeOffset = 0, 2 do for powerOffset = 3, 6 do for nodeOffset = 16, 40, 8 do
-            layouts[#layouts + 1] = { typeOffset = typeOffset, powerOffset = powerOffset, nodeOffset = nodeOffset }
-        end end end
-    end
+    local reach = (dash.failures or 0) > 0 and 16384 or 1024 -- wider search only after a miss
     local found, seen, owned = {}, {}, {}
     for _, entry in ipairs(entries) do
         local address = type(entry) == "table" and tonumber(entry.addr)
-        local tag = validAddress(address) and memoryValue("int", address + 12)
-        local history = tag and nodeName(address) == "travelHistory" and memoryValue("uintptr_t", address)
+        local history = validAddress(address) and nodeName(address) == "travelHistory" and memoryValue("uintptr_t", address)
         if validAddress(history) and history >= 65536 and not seen[history] then
             seen[history] = true
-            -- MovementModel.new() builds the table and its travelHistory together, so the header is allocated nearby.
+            -- MovementModel.new() builds the table and its travelHistory together, so the header is allocated nearby;
+            -- its node pointer is the word that points at the node array holding this travelHistory node.
             for offset = -reach, reach, 8 do
-                local at = history + offset
-                for _, layout in ipairs(layouts) do
-                    local header = { address = at, tag = tag, typeOffset = layout.typeOffset,
-                        powerOffset = layout.powerOffset, nodeOffset = layout.nodeOffset }
-                    local base, size = headerNodes(header)
-                    local nodes = base and not owned[base] and scanNodes(base, size)
-                    local live = nodes and number(nodes.dashCount)
-                    if live and live >= count and memoryValue("uintptr_t", nodes.travelHistory or 0) == history then
-                        owned[base] = true
-                        found[#found + 1] = { header = header, base = base, size = size, nodes = nodes, count = live }
+                local pointerAt = history + offset
+                local base = memoryValue("uintptr_t", pointerAt)
+                local index = validAddress(base) and base >= 65536 and (address - base) / 32
+                if index and index >= 0 and index < 1024 and index % 1 == 0 and not owned[base] then
+                    local rels = {}
+                    if dash.powerRel then rels[1] = dash.powerRel else for rel = -48, -1 do rels[#rels + 1] = rel end end
+                    for _, rel in ipairs(rels) do
+                        local power = sizeByteAt(pointerAt + rel)
+                        local nodes = power and 2 ^ power > index and scanNodes(base, 2 ^ power)
+                        local live = nodes and number(nodes.dashCount)
+                        if live and live >= count and nodes.travelHistory == address then
+                            owned[base] = true
+                            found[#found + 1] = { header = { address = pointerAt, pointerAt = pointerAt, powerAt = pointerAt + rel },
+                                base = base, size = 2 ^ power, nodes = nodes, count = live }
+                            break
+                        end
                     end
                 end
             end
@@ -290,7 +296,6 @@ local function discoverDash(c, count)
         if found[i].count ~= fresh then table.remove(found, i) end
     end
     if #found ~= 1 then
-        if not dash.layout then dash.swept = true end -- next attempt tries every struct layout
         return nil, #found == 0 and "Dash state not found" or "Dash state ambiguous", fresh
     end
     local track = found[1]
@@ -299,7 +304,7 @@ local function discoverDash(c, count)
         if track.nodes[name .. "Key"] then keyNames[track.nodes[name .. "Key"]] = name end
     end
     keyNames[track.nodes.travelHistoryKey] = "travelHistory"
-    dash.layout = { typeOffset = track.header.typeOffset, powerOffset = track.header.powerOffset, nodeOffset = track.header.nodeOffset }
+    dash.powerRel = track.header.powerAt - track.header.pointerAt
     return track, nil, fresh
 end
 local function writeNumber(track, name, value)
@@ -514,7 +519,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.23 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.43 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
