@@ -133,7 +133,13 @@ end
 local function notify(title, message)
     ui:Notify({ Title = title, Content = message, Duration = 4 })
 end
+local move = { noTurn = false, noStall = false, buffer = false, noRecovery = false, momentum = false,
+    momentumTime = 1, status = "Off" }
 local lunge
+local function releaseBuffer()
+    if move.pressedAt and type(keyrelease) == "function" then pcall(keyrelease, 0x20) end
+    move.pressedAt, move.pendingUntil = nil, nil
+end
 local function releaseAutoTackle()
     if lunge and lunge.pressedAt and type(keyrelease) == "function" then pcall(keyrelease, 0x45) end
     if lunge then lunge.pressedAt = nil end
@@ -147,6 +153,7 @@ end
 function app.stop()
     if not app.alive then return end
     releaseAutoTackle()
+    releaseBuffer()
     app.alive = false
     if connection then connection:Disconnect() end
     if ui.Alive then ui:Destroy() end
@@ -183,12 +190,13 @@ local function roleSlider(tab, role, title, lo, hi, step, default, suffix, value
         Callback = function(v) apply(v) end })
     return c
 end
-roleToggle(runnerTab, "Runner", "speed", "Speed tuning", "Uses movement input; preserves falling/jumping velocity", false,
+roleToggle(runnerTab, "Runner", "speed", "Speed tuning", "Holds your run speed through the game's movement model", false,
     function(on) state.speed = on; pendingVelocity = nil end)
 roleSlider(runnerTab, "Runner", "Travel speed", 10, MAX_SPEED, 1, state.target, " studs/s", function() return state.target end,
     function(v) state.target = v end)
 local dash = { infinite = false, longer = false, scale = 1.5, status = "Off", boost = "Off" }
 app.dashState = dash -- lets tools/valley_test.js inspect the shared tracker
+app.moveState = move -- shared movement-memory state, inspectable like dashState
 lunge = { enabled = false, auto = false, range = 9, status = "Off" }
 app.lunge = lunge
 local cooldownGroup = runnerTab:AddIsland({ Title = "Dash cooldown" })
@@ -201,6 +209,20 @@ roleToggle(distanceGroup, "Runner", "longer", "Longer dash", "Each dash travels 
 roleSlider(distanceGroup, "Runner", "Dash distance", 1.1, 3, .1, dash.scale, "x", function() return dash.scale end,
     function(v) dash.scale = v end)
 liveLabel(distanceGroup, "Distance status", function() return dash.longer and (dash.track and dash.boost or dash.status) or "Off" end)
+local memoryGroup = runnerTab:AddIsland({ Title = "Movement memory" })
+roleToggle(memoryGroup, "Runner", "noTurn", "No turn slowdown", nil, false,
+    function(on) move.noTurn = on end)
+roleToggle(memoryGroup, "Runner", "noStall", "No stall cap", nil, false,
+    function(on) move.noStall = on end)
+roleToggle(memoryGroup, "Runner", "dashBuffer", "Dash buffer", "Queues Space pressed early", false,
+    function(on) move.buffer = on; if not on then releaseBuffer() end end)
+roleToggle(memoryGroup, "Runner", "noRecovery", "No recovery slowdown", nil, false,
+    function(on) move.noRecovery = on end)
+roleToggle(memoryGroup, "Runner", "momentum", "Dash momentum", "Keep dash speed after it ends", false,
+    function(on) move.momentum = on end)
+roleSlider(memoryGroup, "Runner", "Momentum time", .25, 2, .25, move.momentumTime, " s", function() return move.momentumTime end,
+    function(v) move.momentumTime = v end)
+liveLabel(memoryGroup, "Memory status", function() return move.status end)
 local lungeGroup = catcherTab:AddIsland({ Title = "Lunge lock-on" })
 roleToggle(lungeGroup, "Catcher", "lunge", "Lunge lock-on", "Faces the nearest runner", false,
     function(on) lunge.enabled = on end)
@@ -214,6 +236,7 @@ local function clearRoleEffects()
     pendingVelocity, movementStatus = nil, "Off"
     dash.motion, dash.status = nil, "Off" -- keep dash.track: it stays valid until the character changes
     dash.failedCount, dash.nextScan = nil, 0
+    releaseBuffer()
     releaseAutoTackle()
     lunge.lock, lunge.status, lunge.seenMotion = nil, "Off", nil
 end
@@ -241,9 +264,12 @@ syncRole(tick(), true)
 -- Luau node (32 bytes): value +0, value tag +12, key string +16, key tag (low 4 bits) and chain +28.
 local requiredKeys = { "dashCount", "cooldown", "dashRemaining", "recoveryRemaining" }
 local boostKeys = { "dashElapsed", "boostStart", "boostExit", "boostLift" }
+-- Optional movement-model fields: absent until the game first writes them (carry fields especially).
+local moveKeys = { "speed", "stalled", "turnAngle", "carryRemaining", "carrySeconds" }
 local wantedKeys = { travelHistory = true }
 for _, name in ipairs(requiredKeys) do wantedKeys[name] = true end
 for _, name in ipairs(boostKeys) do wantedKeys[name] = true end
+for _, name in ipairs(moveKeys) do wantedKeys[name] = true end
 local keyNames = {} -- interned key string address -> name, learned on the first discovery
 local function memoryValue(kind, address)
     local success, value = pcall(memory_read, kind, address)
@@ -282,48 +308,60 @@ local function scanNodes(base, size)
     for _, name in ipairs(boostKeys) do
         if not nodes[name] or not number(nodes[name]) then nodes.noBoost = true end
     end
+    for _, name in ipairs(moveKeys) do
+        if not nodes[name] or not number(nodes[name]) then nodes.noMove = true end
+    end
     return nodes
 end
 -- The table header keeps its address for the character's whole life; only its node array moves on rehash.
+-- Roblox reshuffles the header's fields between client builds (2026-10: size byte moved, node pointer +24 -> +40),
+-- so discovery finds the node pointer by what it points at and learns where the size byte sits next to it.
 local function headerNodes(header)
-    local at = header.address
-    if memoryValue("byte", at + header.typeOffset) ~= header.tag then return end
-    local power = memoryValue("byte", at + header.powerOffset)
-    if not finite(power) or power < 2 or power > 10
-        or memoryValue("byte", at + header.powerOffset + 1) ~= (2 ^ power - 1) % 256 then return end
-    local base = memoryValue("uintptr_t", at + header.nodeOffset)
+    local power = memoryValue("byte", header.powerAt)
+    if not finite(power) or power < 2 or power > 10 then return end
+    local base = memoryValue("uintptr_t", header.pointerAt)
     if validAddress(base) and base >= 65536 then return base, 2 ^ power end
+end
+-- Luau keeps the node mask (2^size - 1) within a few bytes of the size byte, before or after it depending on
+-- the client build (2026-10-17: mask after; 2026-10-22: mask before). Requiring it rules out stray bytes.
+local function sizeByteAt(address)
+    local power = memoryValue("byte", address)
+    if not finite(power) or power < 2 or power > 10 then return end
+    for gap = -3, 3 do
+        if gap ~= 0 and memoryValue("byte", address + gap) == (2 ^ power - 1) % 256 then return power end
+    end
 end
 local function discoverDash(c, count)
     local success, entries = pcall(getgc, { "travelHistory" })
     if not success or type(entries) ~= "table" then return nil, "Memory scan unavailable" end
-    -- Layout measured live 2026-10-06; the full sweep only runs if Roblox reshuffles the table struct.
-    local layouts = { dash.layout or { typeOffset = 1, powerOffset = 4, nodeOffset = 24 } }
-    local reach = dash.layout and (dash.failures or 0) > 0 and 16384 or 1024 -- wide search only with one known layout
-    if dash.layout == nil and dash.swept then
-        for typeOffset = 0, 2 do for powerOffset = 3, 6 do for nodeOffset = 16, 40, 8 do
-            layouts[#layouts + 1] = { typeOffset = typeOffset, powerOffset = powerOffset, nodeOffset = nodeOffset }
-        end end end
-    end
+    local reach = (dash.failures or 0) > 0 and 16384 or 1024 -- wider search only after a miss
     local found, seen, owned = {}, {}, {}
     for _, entry in ipairs(entries) do
         local address = type(entry) == "table" and tonumber(entry.addr)
-        local tag = validAddress(address) and memoryValue("int", address + 12)
-        local history = tag and nodeName(address) == "travelHistory" and memoryValue("uintptr_t", address)
+        local history = validAddress(address) and nodeName(address) == "travelHistory" and memoryValue("uintptr_t", address)
         if validAddress(history) and history >= 65536 and not seen[history] then
             seen[history] = true
-            -- MovementModel.new() builds the table and its travelHistory together, so the header is allocated nearby.
+            -- MovementModel.new() builds the table and its travelHistory together, so the header is allocated nearby;
+            -- its node pointer is the word that points at the node array holding this travelHistory node.
             for offset = -reach, reach, 8 do
-                local at = history + offset
-                for _, layout in ipairs(layouts) do
-                    local header = { address = at, tag = tag, typeOffset = layout.typeOffset,
-                        powerOffset = layout.powerOffset, nodeOffset = layout.nodeOffset }
-                    local base, size = headerNodes(header)
-                    local nodes = base and not owned[base] and scanNodes(base, size)
-                    local live = nodes and number(nodes.dashCount)
-                    if live and live >= count and memoryValue("uintptr_t", nodes.travelHistory or 0) == history then
-                        owned[base] = true
-                        found[#found + 1] = { header = header, base = base, size = size, nodes = nodes, count = live }
+                local pointerAt = history + offset
+                local base = memoryValue("uintptr_t", pointerAt)
+                local index = validAddress(base) and base >= 65536 and (address - base) / 32
+                if index and index >= 0 and index < 1024 and index % 1 == 0 and not owned[base] then
+                    local rels = {}
+                    if dash.powerRel then rels[1] = dash.powerRel else
+                        for rel = -64, 64 do if rel < 0 or rel > 7 then rels[#rels + 1] = rel end end
+                    end
+                    for _, rel in ipairs(rels) do
+                        local power = sizeByteAt(pointerAt + rel)
+                        local nodes = power and 2 ^ power > index and scanNodes(base, 2 ^ power)
+                        local live = nodes and number(nodes.dashCount)
+                        if live and live >= count and nodes.travelHistory == address then
+                            owned[base] = true
+                            found[#found + 1] = { header = { address = pointerAt, pointerAt = pointerAt, powerAt = pointerAt + rel },
+                                base = base, size = 2 ^ power, nodes = nodes, count = live }
+                            break
+                        end
                     end
                 end
             end
@@ -335,7 +373,6 @@ local function discoverDash(c, count)
         if found[i].count ~= fresh then table.remove(found, i) end
     end
     if #found ~= 1 then
-        if not dash.layout then dash.swept = true end -- next attempt tries every struct layout
         return nil, #found == 0 and "Dash state not found" or "Dash state ambiguous", fresh
     end
     local track = found[1]
@@ -343,8 +380,11 @@ local function discoverDash(c, count)
     for _, name in ipairs(boostKeys) do
         if track.nodes[name .. "Key"] then keyNames[track.nodes[name .. "Key"]] = name end
     end
+    for _, name in ipairs(moveKeys) do
+        if track.nodes[name .. "Key"] then keyNames[track.nodes[name .. "Key"]] = name end
+    end
     keyNames[track.nodes.travelHistoryKey] = "travelHistory"
-    dash.layout = { typeOffset = track.header.typeOffset, powerOffset = track.header.powerOffset, nodeOffset = track.header.nodeOffset }
+    dash.powerRel = track.header.powerAt - track.header.pointerAt
     return track, nil, fresh
 end
 local function writeNumber(track, name, value)
@@ -378,6 +418,88 @@ local function extendDash(track, count)
     end
     dash.boost = string.format("Dash %s: %.1f -> %.1f studs", tostring(count), duration * pace, duration * pace * dash.scale)
 end
+-- Movement-memory features act on the game's private MovementModel fields through the same tracked
+-- table as the dash features: memory reads/writes only, never per-frame GetAttribute or property writes.
+local function moveMemoryStep(track, nodes, now, remaining)
+    local moved = nodes.noMove ~= true -- memory fields may appear on a later dash without a rehash
+    local dt = now - (move.lastNow or now)
+    if dt < 0 or dt > .1 then dt = 1 / 60 end
+    move.lastNow = now
+    local function off() move.status = "Waiting for movement state"; return false end
+    if not moved and now >= (track.nextMoveScan or 0) then
+        track.nextMoveScan = now + 1
+        nodes = scanNodes(track.base, track.size) or nodes
+        track.nodes = nodes
+        moved = nodes.noMove ~= true
+    end
+    if not moved then return off() end
+    local speed = number(nodes.speed)
+    local stalled, turnAngle = number(nodes.stalled), number(nodes.turnAngle)
+    local recovery = number(nodes.recoveryRemaining)
+    local cooldown = number(nodes.cooldown)
+    if not speed then track.base = nil; return off() end -- node moved under us; next frame re-reads the header
+    local active = move.noStall or move.noTurn or move.noRecovery or move.momentum or move.buffer or state.speed
+    if not active then move.status = "Off"; return false end
+    local carry = nodes.carryRemaining and nodes.carrySeconds
+    -- Dash buffer: press-and-hold Space for the player when they pressed early into the cooldown.
+    if move.buffer then
+        local down = key(0x20)
+        if down and not move.spaceDown
+            and ((remaining or 0) > 0 or (cooldown or 0) > 0 or (recovery or 0) > 0) then
+            if type(keypress) == "function" and not move.pendingUntil then move.pendingUntil = now + .35 end
+        end
+        if move.pendingUntil and now <= move.pendingUntil and (remaining or 0) <= 0 and (cooldown or 0) <= 0
+            and (recovery or 0) <= 0 and type(keypress) == "function" then
+            keypress(0x20)
+            move.pressedAt = now
+            move.pendingUntil = nil
+        end
+        if move.pressedAt and now - move.pressedAt >= .05 then releaseBuffer() end
+        move.spaceDown = down
+    end
+    if move.noStall and stalled and stalled > 0 then writeNumber(track, "stalled", 0) end
+    if move.noTurn and turnAngle and turnAngle >= 5 and (remaining or 0) <= 0
+        and speed < (move.prevSpeed or speed) * .98 then
+        writeNumber(track, "speed", move.prevSpeed)
+        speed = move.prevSpeed
+    end
+    move.prevSpeed = speed
+    if move.noRecovery and (remaining or 0) <= 0 and recovery and recovery > 0 then
+        writeNumber(track, "recoveryRemaining", 0)
+    end
+    if move.momentum then
+        if (move.lastRemaining or 0) > 0 and remaining <= 0 then
+            local start, exit, lift = number(nodes.boostStart), number(nodes.boostExit), number(nodes.boostLift)
+            local pace = start and exit and lift and (start + exit) / 2 + lift or speed
+            local target = math.min(pace, MAX_SPEED)
+            if target > speed then
+                writeNumber(track, "speed", target)
+                if carry and type(move.momentumTime) == "number" then
+                    writeNumber(track, "carrySeconds", move.momentumTime)
+                    writeNumber(track, "carryRemaining", move.momentumTime)
+                end
+            end
+        end
+        move.lastRemaining = remaining
+    end
+    if state.speed and (remaining or 0) <= 0
+        and (key(0x57) or key(0x41) or key(0x53) or key(0x44)) then
+        local target = math.min(state.target, MAX_SPEED)
+        if speed < target - .5 then
+            writeNumber(track, "speed", math.min(target, speed + 90 * dt))
+            move.memorySpeed = true
+            if carry then
+                writeNumber(track, "carrySeconds", .5)
+                writeNumber(track, "carryRemaining", .5)
+            end
+        else
+            move.memorySpeed = true
+            if carry then writeNumber(track, "carryRemaining", 0) end
+        end
+    end
+    move.status = string.format("Memory active: speed %.0f/%.0f", speed, math.min(state.target, MAX_SPEED))
+    return true
+end
 local function loseDash(reason)
     dash.track, dash.status = nil, reason .. "; dash to find it again"
     log("Dash state: " .. reason)
@@ -386,7 +508,9 @@ local function dashStep(c, now)
     dash.motion = nil
     -- A waiting Runner still finds the table, so both features work from the first dash of the round.
     local runner = activeRole == "Runner"
-    if (not runner and lastGameRole ~= "Runner") or not dash.infinite and not dash.longer then dash.status = "Off"; return end
+    local moveOn = runner and (dash.infinite or dash.longer or move.noTurn or move.noStall
+        or move.buffer or move.noRecovery or move.momentum or state.speed)
+    if (not runner and lastGameRole ~= "Runner") or not moveOn then dash.status = "Off"; return end
     if type(getgc) ~= "function" or type(memory_read) ~= "function" or type(memory_write) ~= "function" then
         dash.status = "Enable unsafe Lua execution in Matcha"; return
     end
@@ -441,8 +565,8 @@ local function dashStep(c, now)
     if not runner then dash.status = "Ready for the round"; return end
     if count ~= dash.lastCount then
         dash.lastCount = count
-        -- Boost fields appear after the first dash, often without a rehash: re-walk once to pick them up.
-        if nodes.noBoost then nodes = scanNodes(track.base, track.size) or nodes; track.nodes = nodes end
+        -- Boost and movement fields can appear later, often without a rehash: re-walk once to pick them up.
+        if nodes.noBoost or nodes.noMove then nodes = scanNodes(track.base, track.size) or nodes; track.nodes = nodes end
         if dash.longer then extendDash(track, count) end
     end
     if dash.infinite then
@@ -453,6 +577,9 @@ local function dashStep(c, now)
         if remaining <= 0 and recovery and recovery > 0 then writeNumber(track, "recoveryRemaining", 0) end
     end
     dash.status = remaining > 0 and "Dashing" or "Ready: turn + Space to dash"
+    -- Movement memory rides the same tracker; the game reads these fields through its own movement model.
+    move.memorySpeed = false
+    moveMemoryStep(track, nodes, now, remaining)
 end
 local function movementDirection(humanoid)
     local forward = (key(0x57) and 1 or 0) - (key(0x53) and 1 or 0)
@@ -478,6 +605,10 @@ local function movementDirection(humanoid)
 end
 local function movementStep(c, root, now)
     if activeRole ~= "Runner" or not state.speed then movementStatus = "Off"; return end
+    -- With the movement table tracked, speed writes go through moveMemoryStep; the old per-frame
+    -- AssemblyLinearVelocity write stays only as the fallback until the table is discovered.
+    local tracked = dash.track and not dash.track.nodes.noMove
+    if tracked or move.memorySpeed then movementStatus = "Memory speed"; return end
     if child(root, "LocalTackleVelocity") then
         pendingVelocity = nil; movementStatus = "Paused: tackle lunge"; return
     end
@@ -785,7 +916,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.42 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.45 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
