@@ -269,7 +269,7 @@ local function nodeName(address)
     local known = keyNames[pointer]
     if known then return known, pointer end
     local length = memoryValue("int", pointer + 20)
-    if not finite(length) or length < 8 or length > 17 then return end
+    if not finite(length) or length < 4 or length > 17 then return end -- "speed" is 5 letters
     local name = memoryValue("string", pointer + 24)
     if wantedKeys[name] and #name == length then return name, pointer end
 end
@@ -488,7 +488,7 @@ end
 local function dashStep(c, now)
     dash.motion = nil
     -- A waiting Runner still finds the table, so both features work from the first dash of the round.
-    local runner = activeRole == "Runner"
+    local runner = activeRole ~= "Catcher" -- lobby / waiting / Runner all count; only an active Catcher is off
     local moveOn = runner and (dash.infinite or dash.longer or move.noTurn or move.noStall
         or move.buffer or move.noRecovery or move.momentum or state.speed)
     if (not runner and lastGameRole ~= "Runner") or not moveOn then dash.status = "Off"; return end
@@ -585,7 +585,7 @@ local function movementDirection(humanoid)
         look.Z / lookLength * forward + right.Z / rightLength * side)
 end
 local function movementStep(c, root, now)
-    if activeRole ~= "Runner" or not state.speed then movementStatus = "Off"; return end
+    if activeRole == "Catcher" or not state.speed then movementStatus = "Off"; return end
     -- With the movement table tracked, speed writes go through moveMemoryStep; the old per-frame
     -- AssemblyLinearVelocity write stays only as the fallback until the table is discovered.
     local tracked = dash.track and not dash.track.nodes.noMove
@@ -677,7 +677,7 @@ connection = frame:Connect(function()
     if stepErrors == 1 then log("Runtime error: " .. tostring(err)) end
     if stepErrors >= 120 then log("Stopping after repeated runtime errors"); app.stop() end
 end)
-log("Loaded Huss Valley v0.6.46 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
+log("Loaded Huss Valley v0.6.48 with GitHub JDUI " .. tostring(ui.Version) .. "; settings: " .. tostring(ui.ConfigFile))
 end
 local pending = rawget(_G, "ValleyJDUIStartup")
 if type(pending) == "table" and type(pending.stop) == "function" then pcall(pending.stop) end
